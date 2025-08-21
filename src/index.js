@@ -1,5 +1,5 @@
 import "dotenv/config";
-import { Client, GatewayIntentBits, Partials, ChannelType, Events } from "discord.js";
+import { Client, GatewayIntentBits, Partials, ChannelType, Events, PermissionsBitField } from "discord.js";
 import OpenAI from "openai";
 
 // ---------- Config ----------
@@ -8,9 +8,11 @@ const REPLY_CHANCE_QUESTION = Number(process.env.REPLY_CHANCE_QUESTION) || 0.85;
 const IDLE_MINUTES = Number(process.env.IDLE_MINUTES) || 30;
 const STARTER_COOLDOWN_MINUTES = Number(process.env.STARTER_COOLDOWN_MINUTES) || 45;
 const LANGUAGE = process.env.LANGUAGE || "en-GB"; // UK English by default
-
-// UK time / timezone
 const TIMEZONE = process.env.TIMEZONE || "Europe/London";
+
+// Webhook target channel for testing (defaults to #bot-test)
+const WEBHOOK_CHANNEL_NAME = (process.env.WEBHOOK_CHANNEL_NAME || "bot-test").toLowerCase();
+
 const ukDate = (ts) =>
   new Intl.DateTimeFormat("en-GB", {
     timeZone: TIMEZONE,
@@ -209,6 +211,70 @@ async function aiReply(prompt) {
   }
 }
 
+// ---------- Webhook utilities ----------
+const webhookCache = new Map(); // channelId -> webhook
+
+async function getOrCreateWebhook(channel) {
+  try {
+    if (!channel || channel.type !== ChannelType.GuildText) return null;
+
+    // Only use webhook in the configured testing channel
+    if (channel.name.toLowerCase() !== WEBHOOK_CHANNEL_NAME) return null;
+
+    const me = channel.guild?.members?.me;
+    const perms = channel.permissionsFor(me);
+
+    // Need Manage Webhooks to create; we can still use existing ones if visible.
+    const canManage = perms?.has(PermissionsBitField.Flags.ManageWebhooks);
+
+    // Cached?
+    const cached = webhookCache.get(channel.id);
+    if (cached) return cached;
+
+    // Try to find existing webhook created before
+    const hooks = await channel.fetchWebhooks().catch(() => null);
+    const existing = hooks?.find(h => h.token); // must have token to send
+    if (existing) {
+      webhookCache.set(channel.id, existing);
+      return existing;
+    }
+
+    // Create a fresh webhook if allowed
+    if (canManage) {
+      const avatarURL = client.user.displayAvatarURL({ size: 256 });
+      const created = await channel.createWebhook({
+        name: client.user.username,
+        avatar: avatarURL,
+        reason: "Create webhook for human-like messages"
+      });
+      webhookCache.set(channel.id, created);
+      return created;
+    }
+
+    // No permission to create and none exist
+    return null;
+  } catch (e) {
+    console.warn("getOrCreateWebhook error:", e?.message || e);
+    return null;
+  }
+}
+
+async function sendViaWebhook(channel, content) {
+  const hook = await getOrCreateWebhook(channel);
+  if (hook) {
+    // Use bot's current name/avatar to keep consistency
+    const avatarURL = client.user.displayAvatarURL({ size: 256 });
+    return hook.send({
+      content,
+      username: client.user.username,
+      avatarURL,
+      allowedMentions: { parse: [] }
+    });
+  }
+  // Fallback to normal send if webhook not available
+  return channel.send({ content, allowedMentions: { parse: [] } });
+}
+
 // ---------- Idle starter ----------
 async function idleSweep() {
   const now = Date.now();
@@ -231,7 +297,7 @@ async function idleSweep() {
           const prompt = `No one has chatted for a while in #${ch.name}. Create ONE short cheeky opener under 45 words and end with a question.`;
           const ai = await aiReply(prompt);
           const text = (ai || cheekyStarter(ch.name)).trim();
-          await ch.send({ content: text, allowedMentions: { parse: [] } });
+          await sendViaWebhook(ch, text);
           markStarter(ch.id);
         } catch (e) {
           console.warn("starter failed for channel", ch.id, e?.message || e);
@@ -288,7 +354,7 @@ client.on(Events.MessageCreate, async (message) => {
     let out = await aiReply(prompt);
     if (!out) out = "my brain just buffered 🤖💭—say that again?";
 
-    await message.channel.send({ content: out, allowedMentions: { parse: [] } });
+    await sendViaWebhook(message.channel, out);
   } catch (e) {
     console.error("on message error:", e?.message || e);
   }
