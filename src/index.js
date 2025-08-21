@@ -34,7 +34,6 @@ client.once(Events.ClientReady, () => {
     console.log(`[ALLOWED in ${guild.name}]`, list || "(none)");
   }
   // Heartbeat log every 10s so we know logs are streaming
-  setInterval(() => console.log("HEARTBEAT", new Date().toISOString()), 10_000).unref();
 });
 
 client.on(Events.MessageCreate, async (message) => {
