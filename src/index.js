@@ -222,58 +222,44 @@ async function aiReply(prompt) {
 }
 
 // ---------- Webhook utilities ----------
-const webhookCache = new Map(); // channelId -> webhook
+import { WebhookClient } from "discord.js";
 
-async function getOrCreateWebhook(channel) {
-  try {
-    if (!channel || channel.type !== ChannelType.GuildText) return null;
-    if (channel.name.toLowerCase() !== WEBHOOK_CHANNEL_NAME) return null; // only use webhook in the test channel
-
-    const me = channel.guild?.members?.me;
-    const perms = channel.permissionsFor(me);
-    const canManage = perms?.has(PermissionsBitField.Flags.ManageWebhooks);
-
-    const cached = webhookCache.get(channel.id);
-    if (cached) return cached;
-
-    const hooks = await channel.fetchWebhooks().catch(() => null);
-    const existing = hooks?.find(h => h.token);
-    if (existing) {
-      webhookCache.set(channel.id, existing);
-      return existing;
-    }
-
-    if (canManage) {
-      const avatarURL = client.user.displayAvatarURL({ size: 256 });
-      const created = await channel.createWebhook({
-        name: client.user.username,
-        avatar: avatarURL,
-        reason: "Create webhook for human-like messages"
-      });
-      webhookCache.set(channel.id, created);
-      return created;
-    }
-
-    console.warn(`[WEBHOOK] Missing "Manage Webhooks" in #${channel.name}; falling back to normal send (will show App tag).`);
-    return null;
-  } catch (e) {
-    console.warn("getOrCreateWebhook error:", e?.message || e);
-    return null;
-  }
-}
+const WEBHOOK_URL = process.env.WEBHOOK_URL || "";
+const webhookClient = WEBHOOK_URL ? new WebhookClient({ url: WEBHOOK_URL }) : null;
 
 async function sendViaWebhook(channel, content) {
-  const hook = await getOrCreateWebhook(channel);
-  if (hook) {
+  // Prefer manual (non-application) webhook to avoid the "App" badge.
+  if (webhookClient && channel.name.toLowerCase() === WEBHOOK_CHANNEL_NAME) {
     const avatarURL = client.user.displayAvatarURL({ size: 256 });
-    console.log(`[WEBHOOK] Sending via webhook in #${channel.name}`);
-    return hook.send({
+    console.log(`[WEBHOOK] Sending via MANUAL webhook in #${channel.name}`);
+    return webhookClient.send({
       content,
-      username: client.user.username,
-      avatarURL,
+      username: client.user.username,   // the display name you want
+      avatarURL,                        // keep avatar in sync with bot
       allowedMentions: { parse: [] }
     });
   }
+
+  // Fallback: if no manual webhook configured, use/create an app-owned one
+  // (will show the App badge). You can remove this fallback if you want to
+  // guarantee no App badge ever appears.
+  try {
+    const hooks = await channel.fetchWebhooks().catch(() => null);
+    const existing = hooks?.find(h => h.token);
+    if (existing) {
+      console.log(`[WEBHOOK] Sending via APP-OWNED webhook in #${channel.name}`);
+      return existing.send({
+        content,
+        username: client.user.username,
+        avatarURL: client.user.displayAvatarURL({ size: 256 }),
+        allowedMentions: { parse: [] }
+      });
+    }
+  } catch (e) {
+    console.warn("app-owned webhook fallback error:", e?.message || e);
+  }
+
+  // Final fallback: normal send (will show App badge)
   console.log(`[WEBHOOK] Fallback normal send in #${channel.name}`);
   return channel.send({ content, allowedMentions: { parse: [] } });
 }
