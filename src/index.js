@@ -19,6 +19,7 @@ const LANGUAGE = process.env.LANGUAGE || "en-GB";            // UK English
 const TIMEZONE = process.env.TIMEZONE || "Europe/London";     // GMT/BST
 if (!process.env.TZ) process.env.TZ = TIMEZONE;               // make Node use UK time
 
+// Models
 const MODEL = process.env.MODEL || "deepseek/deepseek-r1:free";
 const FALLBACK_MODEL = process.env.MODEL_FALLBACK || "openrouter/auto"; // robust fallback
 
@@ -32,11 +33,10 @@ const KB_RECENCY_BOOST_DAYS = Number(process.env.KB_RECENCY_BOOST_DAYS) || 45;
 
 // Stickers
 const STICKER_IDLE_CHANCE = Number(process.env.STICKER_IDLE_CHANCE) || 0.25; // 25% of idle nudges use a sticker
-// New: scheduled sticker broadcast
 const STICKER_BROADCAST_ENABLED = String(process.env.STICKER_BROADCAST_ENABLED || "true").toLowerCase() === "true";
 const STICKER_BROADCAST_INTERVAL_MIN = Number(process.env.STICKER_BROADCAST_INTERVAL_MIN) || 120; // 2 hours
 const STICKER_BROADCAST_JITTER_MIN = Number(process.env.STICKER_BROADCAST_JITTER_MIN) || 12; // +/- jitter
-const STICKER_BROADCAST_IDLE_GUARD_MIN = Number(process.env.STICKER_BROADCAST_IDLE_GUARD_MIN) || 15; // only drop if channel had no messages for 15 min
+const STICKER_BROADCAST_IDLE_GUARD_MIN = Number(process.env.STICKER_BROADCAST_IDLE_GUARD_MIN) || 15;
 
 // Allowed chat channels
 const allowlist = (process.env.CHANNEL_NAME_ALLOWLIST || "")
@@ -75,7 +75,6 @@ function canSendInChannel(ch) {
   } catch { return false; }
 }
 function canReadChannel(ch) {
-  // for KB build — only needs view + read history
   try {
     const me = ch.guild?.members?.me;
     const perms = ch.permissionsFor(me);
@@ -110,7 +109,7 @@ function extractGifQuery(text) {
   return t.replace(/^gif[:\s]*/i, "").trim();
 }
 
-// ---------- Positive, upbeat starters (with seasonal/weekly rotation) ----------
+// ---------- Positive, upbeat starters ----------
 function cheekyStarter(channelName) {
   const base = [
     `Hey #${channelName}, quick vibe check — what’s one good thing that happened today? ✨`,
@@ -168,7 +167,6 @@ function scoreDoc(qTokens, doc) {
   const set = new Set(dTokens);
   for (const t of qTokens) if (set.has(t)) overlap++;
 
-  // recency boost (within last X days)
   const days = (Date.now() - doc.ts) / (24*60*60*1000);
   const recencyBoost = days <= KB_RECENCY_BOOST_DAYS ? 0.5 : 0;
 
@@ -203,31 +201,48 @@ async function buildKnowledgeBase(client) {
   KB.length = 0;
   const names = (process.env.KNOWLEDGE_CHANNELS || "")
     .split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
+
   if (!names.length) {
     console.log("[KB] No KNOWLEDGE_CHANNELS set — skipping build");
     return;
   }
-  let budget = Number(process.env.KNOWLEDGE_MAX_MESSAGES) || 1500;
+
   for (const [, guild] of client.guilds.cache) {
-    for (const [, ch] of guild.channels.cache) {
-      if (ch.type !== ChannelType.GuildText) continue;
-      if (!names.includes(ch.name.toLowerCase())) continue;
-      if (!canReadChannel(ch)) {
+    console.log(`[KB] Scanning guild: ${guild.name}`);
+    let channels;
+    try {
+      // fetch from API to avoid stale cache
+      channels = await guild.channels.fetch();
+    } catch (e) {
+      console.warn("[KB] Could not fetch channels for guild:", guild.name, e?.message || e);
+      continue;
+    }
+
+    for (const [, ch] of channels) {
+      if (!ch || ch.type !== ChannelType.GuildText) continue;
+      const cname = (ch.name || "").toLowerCase();
+      const target = names.includes(cname);
+      if (!target) continue;
+
+      const canRead = canReadChannel(ch);
+      console.log(`[KB] Candidate #${ch.name}: target=${target} canRead=${!!canRead}`);
+
+      if (!canRead) {
         console.warn(`[KB] Missing read perms for #${ch.name} — need View Channel + Read Message History`);
         continue;
       }
+
       try {
-        console.log(`[KB] Fetching from #${ch.name}…`);
-        const take = Math.min(800, budget);
+        const take = Math.min(800, Number(process.env.KNOWLEDGE_MAX_MESSAGES) || 1500);
         const msgs = await fetchHistory(ch, take);
+        console.log(`[KB] #${ch.name}: fetched ${msgs.length} messages`);
         KB.push(...msgs);
-        budget -= msgs.length;
-        if (budget <= 0) break;
       } catch (e) {
-        console.warn("[KB] failed on", ch.name, e?.message || e);
+        console.warn("[KB] fetchHistory failed on", ch.name, e?.message || e);
       }
     }
   }
+
   KB.sort((a, b) => b.ts - a.ts);
   console.log(`[KB] Loaded ${KB.length} messages`);
 }
@@ -246,17 +261,29 @@ function retrieveSnippets(question, k = KB_MAX_SNIPPETS) {
     .join("\n\n");
 }
 
-// ---------- OpenAI client ----------
+// ---------- OpenAI client + global throttle ----------
 const aiClient = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY || process.env.OPENROUTER_API_KEY || "",
   baseURL: process.env.OPENAI_BASE_URL || "https://openrouter.ai/api/v1"
 });
 
-// Robust AI call with retry + fallback
+// simple global throttle: 1 call per THROTTLE_MS
+const THROTTLE_MS = Number(process.env.AI_THROTTLE_MS) || 3000;
+let lastCallAt = 0;
+async function throttle() {
+  const now = Date.now();
+  const delta = now - lastCallAt;
+  if (delta < THROTTLE_MS) {
+    await new Promise(r => setTimeout(r, THROTTLE_MS - delta));
+  }
+  lastCallAt = Date.now();
+}
+
 async function modelCall(model, messages) {
+  await throttle();
   return aiClient.chat.completions.create({
     model,
-    temperature: 0.6,     // tighter for accuracy on KB answers
+    temperature: 0.6,
     max_tokens: 500,
     messages
   });
@@ -285,21 +312,28 @@ ${kbText}`
   const messages = [
     { role: "system", content: sys },
     { role: "user", content: userMsg },
-    { role: "system", content: `Language: ${LANGUAGE}. Be concise, inclusive, SFW. Answer the question directly first, THEN add one cheeky line at most.` }
+    { role: "system", content: `Language: ${LANGUAGE}. Answer the question directly first. If grounded, do not invent info.` }
   ];
 
-  try {
-    const res = await modelCall(MODEL, messages);
-    let out = res?.choices?.[0]?.message?.content?.trim() || "";
-    if (out && !/[.!?]$/.test(out)) out += ".";
-    if (out) return out;
-  } catch (e) {
-    console.warn("[AI] Primary model failed:", e?.status || e?.code || e?.message);
-    if (e?.status === 429 || e?.code === "insufficient_quota") {
-      await new Promise(r => setTimeout(r, 800));
+  // primary with retry/backoff on 429
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const res = await modelCall(MODEL, messages);
+      let out = res?.choices?.[0]?.message?.content?.trim() || "";
+      if (out && !/[.!?]$/.test(out)) out += ".";
+      if (out) return out;
+    } catch (e) {
+      const code = e?.status || e?.code || "";
+      console.warn("[AI] Primary model failed:", code, e?.message || "");
+      if (code === 429 || code === "insufficient_quota") {
+        await new Promise(r => setTimeout(r, 1500 * (attempt + 1)));
+        continue;
+      }
+      break;
     }
   }
 
+  // fallback
   try {
     const res2 = await modelCall(FALLBACK_MODEL, messages);
     let out2 = res2?.choices?.[0]?.message?.content?.trim() || "";
@@ -339,7 +373,7 @@ const guildStickers = new Map(); // guildId -> array of sticker objects
 
 async function loadGuildStickers(guild) {
   try {
-    const coll = await guild.stickers.fetch(); // needs GuildEmojisAndStickers intent
+    const coll = await guild.stickers.fetch();
     const list = [...coll.values()].filter(s => s.available !== false);
     guildStickers.set(guild.id, list);
     console.log(`[STICKERS] ${guild.name}: loaded ${list.length} sticker(s)`);
@@ -387,12 +421,11 @@ async function idleSweep() {
 
       if (idle && cooled) {
         try {
-          // Sometimes send a sticker instead of text
           const roll = Math.random();
           const sticker = roll < STICKER_IDLE_CHANCE ? pickRandomSticker(guild.id) : null;
 
           if (sticker) {
-            await ch.send({ stickers: [sticker] }); // server stickers only
+            await ch.send({ stickers: [sticker] });
           } else {
             await ch.sendTyping();
             const prompt = `Create ONE short, upbeat, welcoming opener for #${ch.name} (max 45 words).
@@ -418,11 +451,11 @@ End with a friendly question that invites anyone to jump in.`;
   }
 }
 
-// ---------- Scheduled sticker broadcast (every ~2 hours with jitter) ----------
+// ---------- Scheduled sticker broadcast ----------
 let nextStickerAt = Date.now();
 function scheduleNextSticker() {
   const base = STICKER_BROADCAST_INTERVAL_MIN * 60 * 1000;
-  const jitter = (Math.random() * 2 - 1) * (STICKER_BROADCAST_JITTER_MIN * 60 * 1000); // +/- jitter
+  const jitter = (Math.random() * 2 - 1) * (STICKER_BROADCAST_JITTER_MIN * 60 * 1000);
   nextStickerAt = Date.now() + Math.max(10_000, base + jitter);
 }
 scheduleNextSticker();
@@ -434,7 +467,6 @@ async function stickerBroadcastSweep() {
 
   try {
     for (const [, guild] of client.guilds.cache) {
-      // ensure stickers cached
       if (!guildStickers.has(guild.id)) await loadGuildStickers(guild);
       const sticker = pickRandomSticker(guild.id);
       if (!sticker) continue;
@@ -443,21 +475,17 @@ async function stickerBroadcastSweep() {
       for (const [, ch] of channels) {
         if (!canSendInChannel(ch)) continue;
 
-        // idle guard: only drop if channel has been quiet for X minutes
         const m = meta.get(ch.id) || {};
         const lastMsg = m.lastMessageTs || 0;
         const quietEnough = (now - lastMsg) > (STICKER_BROADCAST_IDLE_GUARD_MIN * 60 * 1000);
         if (!quietEnough) continue;
 
-        // etiquette: don’t interrupt active threads/convos; we already check quietness
         try {
           await ch.send({ stickers: [sticker] });
         } catch (e) {
           console.warn("[STICKER-BROADCAST] send failed:", e?.message || e);
         }
-
-        // drop to the first eligible channel per guild only (avoid spamming many channels at once)
-        break;
+        break; // one channel per guild per broadcast
       }
     }
   } finally {
@@ -471,7 +499,7 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
-    GatewayIntentBits.GuildEmojisAndStickers // needed to fetch guild stickers
+    GatewayIntentBits.GuildEmojisAndStickers
   ],
   partials: [Partials.Channel, Partials.Message]
 });
@@ -479,11 +507,12 @@ const client = new Client({
 client.once(Events.ClientReady, async () => {
   console.log(`Logged in as ${client.user.tag}`);
 
-  // Preload stickers for each guild
+  // Preload stickers
   for (const [, guild] of client.guilds.cache) {
     await loadGuildStickers(guild);
   }
 
+  // Print allowed channels
   for (const [, guild] of client.guilds.cache) {
     const list = guild.channels.cache
       .filter(allowedChannel)
@@ -492,13 +521,16 @@ client.once(Events.ClientReady, async () => {
     console.log(`[ALLOWED in ${guild.name}]`, list || "(none)");
   }
 
+  // Delay KB build a little so caches & permissions are fully ready
+  setTimeout(() => {
+    buildKnowledgeBase(client).catch(e => console.error("[KB] build error", e));
+  }, 3000);
+
   setInterval(idleSweep, 60 * 1000).unref();
-  setInterval(stickerBroadcastSweep, 30 * 1000).unref(); // check every 30s; fires when window hits
-  buildKnowledgeBase(client).catch(e => console.error("[KB] build error", e));
+  setInterval(stickerBroadcastSweep, 30 * 1000).unref();
 });
 
 client.on(Events.GuildStickersUpdate, (guild) => {
-  // Keep our cache fresh if stickers change
   loadGuildStickers(guild);
 });
 
@@ -512,9 +544,7 @@ client.on(Events.MessageCreate, async (message) => {
     }
 
     // Don't interrupt direct conversations between humans:
-    // 1) If message is a reply to someone (and not us), skip unless they @mention us.
     if (message.reference && !message.mentions.has(client.user)) return;
-    // 2) If message @mentions someone else (and not us), skip.
     if (message.mentions.users.size > 0 && !message.mentions.has(client.user)) return;
 
     markMessage(message.channelId);
@@ -525,7 +555,7 @@ client.on(Events.MessageCreate, async (message) => {
     // probabilistic participation (no @mention required)
     if (!message.mentions.has(client.user) && Math.random() > chance) return;
 
-    // --- GIF handling ---
+    // GIF handling
     if (looksLikeGifRequest(content)) {
       const query = extractGifQuery(content) || "funny";
       if (!TENOR_API_KEY) {
@@ -544,7 +574,7 @@ client.on(Events.MessageCreate, async (message) => {
       return;
     }
 
-    // --- KB grounding for questions ---
+    // KB grounding for questions
     let kbText = "";
     if (isQuestion(content) && KB.length) {
       const snips = retrieveSnippets(content, KB_MAX_SNIPPETS);
