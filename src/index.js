@@ -1,11 +1,23 @@
 import "dotenv/config";
 import { Client, GatewayIntentBits, Partials, ChannelType, Events } from "discord.js";
-import { chat, makeStarterMsg } from "./ai.js";
-import { makeStarter } from "./prompt.js";
 import fs from "fs";
 
-const config = JSON.parse(fs.readFileSync(new URL("../config.json", import.meta.url)));
-const allowlistNames = new Set((process.env.CHANNEL_NAME_ALLOWLIST || (config.channelNameAllowlist || []).join(",")).split(",").map(s => s.trim().toLowerCase()).filter(Boolean));
+// --- simple config (doesn't need editing here) ---
+const config = {
+  language: process.env.LANGUAGE || "en",
+  replyChance: Number(process.env.REPLY_CHANCE) || 0.30,
+  replyChanceIfQuestion: Number(process.env.REPLY_CHANCE_QUESTION) || 0.85,
+  idleMinutesBeforeStarter: Number(process.env.IDLE_MINUTES) || 30,
+  starterCooldownMinutes: Number(process.env.STARTER_COOLDOWN_MINUTES) || 45,
+};
+const DEBUG_ECHO = process.env.DEBUG_ECHO === "1";
+
+// allowlist: comma-separated; empty => allow all non-NSFW text channels
+const allowlist = (process.env.CHANNEL_NAME_ALLOWLIST || "")
+  .split(",")
+  .map(s => s.trim().toLowerCase())
+  .filter(Boolean);
+const allowlistSet = new Set(allowlist);
 
 const client = new Client({
   intents: [
@@ -16,16 +28,13 @@ const client = new Client({
   partials: [Partials.Channel, Partials.Message]
 });
 
-const meta = new Map(); // channelId -> { lastMessageTs, lastStarterTs }
-
 function allowedChannel(ch) {
   if (!ch) return false;
   if (ch.type !== ChannelType.GuildText) return false;
   if (ch.nsfw) return false;
-  if (allowlistNames.size && !allowlistNames.has(ch.name.toLowerCase())) return false;
+  if (allowlistSet.size && !allowlistSet.has(ch.name.toLowerCase())) return false;
   return true;
 }
-
 function canSendInChannel(ch) {
   try {
     const me = ch.guild?.members?.me;
@@ -34,89 +43,55 @@ function canSendInChannel(ch) {
   } catch { return false; }
 }
 
-function markMessage(cid) {
-  const m = meta.get(cid) || {};
-  m.lastMessageTs = Date.now();
-  meta.set(cid, m);
-}
-function markStarter(cid) {
-  const m = meta.get(cid) || {};
-  m.lastStarterTs = Date.now();
-  meta.set(cid, m);
+// Minimal “AI” that just returns empty; we’ll fall back to a cheeky line.
+// (Your real AI runs in another file; for diagnostics we don’t need it.)
+async function fakeAIReply(prompt) {
+  return ""; // force fallback so you always see something
 }
 
 client.once(Events.ClientReady, () => {
   console.log(`Logged in as ${client.user.tag}`);
-  setInterval(checkIdleAndStartConvos, 60 * 1000).unref();
+  for (const [, guild] of client.guilds.cache) {
+    const list = guild.channels.cache
+      .filter(allowedChannel)
+      .map(ch => `#${ch.name} (${ch.id})`)
+      .join(", ");
+    console.log(`[ALLOWED in ${guild.name}]`, list || "(none)");
+  }
 });
 
+// Always echo (parrot) when DEBUG_ECHO=1, otherwise behave with chances
 client.on(Events.MessageCreate, async (message) => {
   try {
     if (message.author.bot) return;
     if (!allowedChannel(message.channel)) return;
-    markMessage(message.channelId);
+    if (!canSendInChannel(message.channel)) {
+      console.warn("[SKIP] missing perms in channel:", message.channel?.name);
+      return;
+    }
 
-    const content = message.content?.trim() || "";
-    const isQuestion = /\?$/.test(content) || /\b(why|how|what|where|who|when)\b/i.test(content);
-    const chance = isQuestion ? (Number(process.env.REPLY_CHANCE_QUESTION) || 0.85) : (Number(process.env.REPLY_CHANCE) || 0.30);
-    if (Math.random() > chance && !message.mentions.has(client.user)) return;
-
-    if (!canSendInChannel(message.channel)) return;
-    await message.channel.sendTyping();
-
-    const context = content.slice(0, 800);
-    const out = await chat({
-      messages: [
-        { role: "user", content: `Channel: #${message.channel.name}. Be casual and witty.` },
-        { role: "user", content: context }
-      ],
-      language: process.env.LANGUAGE || "en",
-      maxTokens: 280
+    console.log("[MSG]", {
+      guild: message.guild?.name,
+      channel: message.channel?.name,
+      content: message.content?.slice(0, 80)
     });
 
-    let text = (out || "").trim();
-    if (!text) {
-      console.warn("AI returned empty; using fallback");
-      text = "my brain just buffered 🤖💭—say that again?";
+    // PARROT MODE: reply to every message deterministically
+    if (DEBUG_ECHO) {
+      await message.channel.send({
+        content: `ECHO: ${message.content || "(no text)"}`,
+        allowedMentions: { parse: [] }
+      });
+      return;
     }
 
-    await message.channel.send({ content: text, allowedMentions: { parse: [] } });
-  } catch (e) {
-    console.error("on message error:", e?.message || e);
-  }
-});
+    // Normal behaviour (30% of messages / 85% if question)
+    const txt = message.content?.trim() || "";
+    const isQuestion = /\?$/.test(txt) || /\b(why|how|what|where|who|when)\b/i.test(txt);
+    const chance = isQuestion ? config.replyChanceIfQuestion : config.replyChance;
+    if (Math.random() > chance && !message.mentions.has(client.user)) return;
 
-async function checkIdleAndStartConvos() {
-  try {
-    const now = Date.now();
-    const idleMs = (Number(process.env.IDLE_MINUTES) || 30) * 60 * 1000;
-    const cooldownMs = (Number(process.env.STARTER_COOLDOWN_MINUTES) || 45) * 60 * 1000;
+    await message.channel.sendTyping();
 
-    for (const [, guild] of client.guilds.cache) {
-      const channels = guild.channels.cache.filter(allowedChannel);
-      for (const [, ch] of channels) {
-        if (!canSendInChannel(ch)) continue;
-        const m = meta.get(ch.id) || {};
-        const lastMsg = m.lastMessageTs || 0;
-        const lastStarter = m.lastStarterTs || 0;
-        const idle = (now - lastMsg) > idleMs;
-        const cooled = (now - lastStarter) > cooldownMs;
-        if (idle && cooled) {
-          try {
-            await ch.sendTyping();
-            const starter = (await makeStarterMsg({ serverName: guild.name, channelName: ch.name })) || makeStarter({ serverName: guild.name, channelName: ch.name });
-            const text = (starter || "Alright then… how’s everyone doing?").trim();
-            await ch.send({ content: text, allowedMentions: { parse: [] } });
-            markStarter(ch.id);
-          } catch (e) {
-            console.warn("starter failed for channel", ch.id, e?.message || e);
-          }
-        }
-      }
-    }
-  } catch (e) {
-    console.error("idle check error", e);
-  }
-}
-
-client.login(process.env.DISCORD_TOKEN);
+    // “Fake AI”: we return empty, then fall back to cheeky line
+    let out =
