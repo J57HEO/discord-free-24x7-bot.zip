@@ -1,10 +1,16 @@
 import "dotenv/config";
-import { Client, GatewayIntentBits, Partials, ChannelType, Events, WebhookClient } from "discord.js";
+import {
+  Client,
+  GatewayIntentBits,
+  Partials,
+  ChannelType,
+  Events,
+  WebhookClient
+} from "discord.js";
 import OpenAI from "openai";
 
 // ---------- Config ----------
 const REPLY_CHANCE = Number(process.env.REPLY_CHANCE) || 0.30;
-the
 const REPLY_CHANCE_QUESTION = Number(process.env.REPLY_CHANCE_QUESTION) || 0.85;
 const IDLE_MINUTES = Number(process.env.IDLE_MINUTES) || 30;
 const STARTER_COOLDOWN_MINUTES = Number(process.env.STARTER_COOLDOWN_MINUTES) || 45;
@@ -66,7 +72,7 @@ function canSendInChannel(ch) {
   try {
     const me = ch.guild?.members?.me;
     const perms = ch.permissionsFor(me);
-    return perms?.has(["ViewChannel","SendMessages","ReadMessageHistory"]);
+    return perms?.has(["ViewChannel", "SendMessages", "ReadMessageHistory"]);
   } catch { return false; }
 }
 
