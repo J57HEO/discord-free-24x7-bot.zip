@@ -4,8 +4,7 @@ import {
   GatewayIntentBits,
   Partials,
   ChannelType,
-  Events,
-  WebhookClient
+  Events
 } from "discord.js";
 import OpenAI from "openai";
 
@@ -20,44 +19,27 @@ const LANGUAGE = process.env.LANGUAGE || "en-GB";
 const TIMEZONE = process.env.TIMEZONE || "Europe/London";
 if (!process.env.TZ) process.env.TZ = TIMEZONE; // ensure Node uses UK time
 
-// ---------- Webhook sending (manual URL ONLY to avoid App badge) ----------
+// Webhook: manual (server-owned) URL to avoid App badge
 const WEBHOOK_URL = process.env.WEBHOOK_URL || "";
+const WEBHOOK_CHANNEL_NAME = (process.env.WEBHOOK_CHANNEL_NAME || "bot-test").toLowerCase();
 
-// Send via the manual server-owned webhook URL using plain HTTP.
-// No discovery, no creation, no app-owned fallback.
-async function sendViaWebhook(channel, content) {
-  try {
-    // Only use the webhook in the configured channel; elsewhere, just normal send.
-    if (WEBHOOK_URL && channel.name.toLowerCase() === (process.env.WEBHOOK_CHANNEL_NAME || "bot-test").toLowerCase()) {
-      console.log(`[WEBHOOK] Sending via MANUAL webhook URL in #${channel.name}`);
-      // Use the webhook’s configured name/avatar. Do NOT override avatar/username here,
-      // to avoid any association with the application.
-      const res = await fetch(WEBHOOK_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          content,
-          allowed_mentions: { parse: [] }
-          // (intentionally NOT setting username or avatar_url;
-          // the webhook's own name & avatar will be used)
-        })
-      });
-      if (!res.ok) {
-        const txt = await res.text().catch(() => "");
-        console.warn(`[WEBHOOK] HTTP ${res.status}: ${txt}`);
-      }
-      return;
-    }
+const ukDate = (ts) =>
+  new Intl.DateTimeFormat("en-GB", {
+    timeZone: TIMEZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false
+  }).format(new Date(ts));
+const nowUK = () => ukDate(Date.now());
 
-    // Elsewhere, fall back to normal send (will show App badge).
-    console.log(`[WEBHOOK] Fallback normal send in #${channel.name}`);
-    return channel.send({ content, allowedMentions: { parse: [] } });
-  } catch (e) {
-    console.warn("[WEBHOOK] send error:", e?.message || e);
-    // Final fallback
-    return channel.send({ content, allowedMentions: { parse: [] } });
-  }
-}
+const allowlist = (process.env.CHANNEL_NAME_ALLOWLIST || "")
+  .split(",")
+  .map(s => s.trim().toLowerCase())
+  .filter(Boolean);
+const allowlistSet = new Set(allowlist);
 
 // ---------- Discord client ----------
 const client = new Client({
@@ -233,22 +215,37 @@ async function aiReply(prompt) {
   }
 }
 
-// ---------- Webhook sending (manual URL to avoid App badge) ----------
+// ---------- Webhook sending (manual URL ONLY to avoid App badge) ----------
 async function sendViaWebhook(channel, content) {
-  // Prefer manual (server-owned) webhook in the configured channel
-  if (webhookClient && channel.name.toLowerCase() === WEBHOOK_CHANNEL_NAME) {
-    const avatarURL = client.user.displayAvatarURL({ size: 256 });
-    console.log(`[WEBHOOK] Sending via MANUAL webhook in #${channel.name}`);
-    return webhookClient.send({
-      content,
-      username: client.user.username,
-      avatarURL,
-      allowedMentions: { parse: [] }
-    });
+  try {
+    const targetName = (process.env.WEBHOOK_CHANNEL_NAME || "bot-test").toLowerCase();
+    if (WEBHOOK_URL && channel.name.toLowerCase() === targetName) {
+      console.log(`[WEBHOOK] Sending via MANUAL webhook URL in #${channel.name}`);
+
+      // Use the webhook’s configured name/avatar (set in Integrations UI).
+      // Do NOT override username/avatar_url here; keeps it server-owned visually.
+      const res = await fetch(WEBHOOK_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          content,
+          allowed_mentions: { parse: [] }
+        })
+      });
+      if (!res.ok) {
+        const txt = await res.text().catch(() => "");
+        console.warn(`[WEBHOOK] HTTP ${res.status}: ${txt}`);
+      }
+      return;
+    }
+
+    // Elsewhere, fall back to normal send (will show App badge)
+    console.log(`[WEBHOOK] Fallback normal send in #${channel.name}`);
+    return channel.send({ content, allowedMentions: { parse: [] } });
+  } catch (e) {
+    console.warn("[WEBHOOK] send error:", e?.message || e);
+    return channel.send({ content, allowedMentions: { parse: [] } });
   }
-  // Fallback: normal send (will show App badge)
-  console.log(`[WEBHOOK] Fallback normal send in #${channel.name}`);
-  return channel.send({ content, allowedMentions: { parse: [] } });
 }
 
 // ---------- Idle starter ----------
@@ -271,7 +268,7 @@ async function idleSweep() {
         try {
           await ch.sendTyping();
           const prompt = `No one has chatted for a while in #${ch.name}. Create ONE short cheeky opener under 45 words and end with a question.`;
-          const ai = await aiReply(prompt);
+        const ai = await aiReply(prompt);
           const text = (ai || cheekyStarter(ch.name)).trim();
           await sendViaWebhook(ch, text);
           markStarter(ch.id);
