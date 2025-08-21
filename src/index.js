@@ -7,10 +7,13 @@ const REPLY_CHANCE = Number(process.env.REPLY_CHANCE) || 0.30;
 const REPLY_CHANCE_QUESTION = Number(process.env.REPLY_CHANCE_QUESTION) || 0.85;
 const IDLE_MINUTES = Number(process.env.IDLE_MINUTES) || 30;
 const STARTER_COOLDOWN_MINUTES = Number(process.env.STARTER_COOLDOWN_MINUTES) || 45;
-const LANGUAGE = process.env.LANGUAGE || "en-GB"; // UK English by default
-const TIMEZONE = process.env.TIMEZONE || "Europe/London";
 
-// Webhook target channel for testing (defaults to #bot-test)
+// UK language & timezone
+const LANGUAGE = process.env.LANGUAGE || "en-GB";
+const TIMEZONE = process.env.TIMEZONE || "Europe/London";
+// Force Node to use UK time (affects Date -> local time)
+if (!process.env.TZ) process.env.TZ = TIMEZONE;
+
 const WEBHOOK_CHANNEL_NAME = (process.env.WEBHOOK_CHANNEL_NAME || "bot-test").toLowerCase();
 
 const ukDate = (ts) =>
@@ -23,6 +26,8 @@ const ukDate = (ts) =>
     minute: "2-digit",
     hour12: false
   }).format(new Date(ts));
+
+const nowUK = () => ukDate(Date.now());
 
 const allowlist = (process.env.CHANNEL_NAME_ALLOWLIST || "")
   .split(",")
@@ -189,14 +194,16 @@ async function aiReply(prompt) {
     const sys = `You are "CheekyBuddy", a friendly, funny, cheeky (but kind) Discord pal.
 - Use UK English.
 - Assume timezone Europe/London (UK). Handle daylight savings (GMT/BST) automatically.
+- Current UK date/time is: ${nowUK()} (DD/MM/YYYY HH:mm). If asked "what time is it", use exactly this value.
 - Use UK formats for dates/times: DD/MM/YYYY and 24-hour clock (e.g., 17:30).
 - Never say you're an AI. Keep it light, inclusive, and SFW.
-- Avoid @here/@everyone. Keep replies under ~90 words.`;
+- Avoid @here/@everyone. Keep replies under ~90 words.
+- End your response with a complete sentence.`;
 
     const res = await aiClient.chat.completions.create({
       model: MODEL,
-      temperature: 0.8,
-      max_tokens: 280,
+      temperature: 0.75,
+      max_tokens: 400, // a bit more room to avoid mid-sentence truncation
       messages: [
         { role: "system", content: sys },
         { role: "user", content: prompt || "Say hi in a fun cheeky way." },
@@ -204,7 +211,10 @@ async function aiReply(prompt) {
       ]
     });
 
-    return res.choices?.[0]?.message?.content?.trim() || "";
+    let out = res.choices?.[0]?.message?.content?.trim() || "";
+    // ensure it finishes the sentence if model forgets punctuation
+    if (out && !/[.!?]$/.test(out)) out += ".";
+    return out;
   } catch (e) {
     console.error("AI error:", e?.status || e?.code || e?.message);
     return ""; // fall back handled by caller
@@ -217,29 +227,22 @@ const webhookCache = new Map(); // channelId -> webhook
 async function getOrCreateWebhook(channel) {
   try {
     if (!channel || channel.type !== ChannelType.GuildText) return null;
-
-    // Only use webhook in the configured testing channel
-    if (channel.name.toLowerCase() !== WEBHOOK_CHANNEL_NAME) return null;
+    if (channel.name.toLowerCase() !== WEBHOOK_CHANNEL_NAME) return null; // only use webhook in the test channel
 
     const me = channel.guild?.members?.me;
     const perms = channel.permissionsFor(me);
-
-    // Need Manage Webhooks to create; we can still use existing ones if visible.
     const canManage = perms?.has(PermissionsBitField.Flags.ManageWebhooks);
 
-    // Cached?
     const cached = webhookCache.get(channel.id);
     if (cached) return cached;
 
-    // Try to find existing webhook created before
     const hooks = await channel.fetchWebhooks().catch(() => null);
-    const existing = hooks?.find(h => h.token); // must have token to send
+    const existing = hooks?.find(h => h.token);
     if (existing) {
       webhookCache.set(channel.id, existing);
       return existing;
     }
 
-    // Create a fresh webhook if allowed
     if (canManage) {
       const avatarURL = client.user.displayAvatarURL({ size: 256 });
       const created = await channel.createWebhook({
@@ -251,7 +254,7 @@ async function getOrCreateWebhook(channel) {
       return created;
     }
 
-    // No permission to create and none exist
+    console.warn(`[WEBHOOK] Missing "Manage Webhooks" in #${channel.name}; falling back to normal send (will show App tag).`);
     return null;
   } catch (e) {
     console.warn("getOrCreateWebhook error:", e?.message || e);
@@ -262,8 +265,8 @@ async function getOrCreateWebhook(channel) {
 async function sendViaWebhook(channel, content) {
   const hook = await getOrCreateWebhook(channel);
   if (hook) {
-    // Use bot's current name/avatar to keep consistency
     const avatarURL = client.user.displayAvatarURL({ size: 256 });
+    console.log(`[WEBHOOK] Sending via webhook in #${channel.name}`);
     return hook.send({
       content,
       username: client.user.username,
@@ -271,7 +274,7 @@ async function sendViaWebhook(channel, content) {
       allowedMentions: { parse: [] }
     });
   }
-  // Fallback to normal send if webhook not available
+  console.log(`[WEBHOOK] Fallback normal send in #${channel.name}`);
   return channel.send({ content, allowedMentions: { parse: [] } });
 }
 
@@ -308,7 +311,7 @@ async function idleSweep() {
 }
 
 // ---------- Events ----------
-client.once(Events.ClientReady, () => {
+client.once(Events.ClientReady, async () => {
   console.log(`Logged in as ${client.user.tag}`);
   for (const [, guild] of client.guilds.cache) {
     const list = guild.channels.cache
@@ -316,6 +319,15 @@ client.once(Events.ClientReady, () => {
       .map(ch => `#${ch.name} (${ch.id})`)
       .join(", ");
     console.log(`[ALLOWED in ${guild.name}]`, list || "(none)");
+    // Pre-create webhook in the target channel so we never fall back
+    const target = guild.channels.cache.find(
+      ch => ch.type === ChannelType.GuildText && ch.name.toLowerCase() === WEBHOOK_CHANNEL_NAME
+    );
+    if (target) {
+      await getOrCreateWebhook(target);
+    } else {
+      console.warn(`[WEBHOOK] Channel #${WEBHOOK_CHANNEL_NAME} not found in ${guild.name}.`);
+    }
   }
   setInterval(idleSweep, 60 * 1000).unref();
   buildKnowledgeBase(client).catch(e => console.error("[KB] build error", e));
