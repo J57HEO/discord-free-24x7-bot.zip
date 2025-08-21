@@ -20,28 +20,44 @@ const LANGUAGE = process.env.LANGUAGE || "en-GB";
 const TIMEZONE = process.env.TIMEZONE || "Europe/London";
 if (!process.env.TZ) process.env.TZ = TIMEZONE; // ensure Node uses UK time
 
-// Webhook: manual (server-owned) URL to avoid App badge
+// ---------- Webhook sending (manual URL ONLY to avoid App badge) ----------
 const WEBHOOK_URL = process.env.WEBHOOK_URL || "";
-const WEBHOOK_CHANNEL_NAME = (process.env.WEBHOOK_CHANNEL_NAME || "bot-test").toLowerCase();
-const webhookClient = WEBHOOK_URL ? new WebhookClient({ url: WEBHOOK_URL }) : null;
 
-const ukDate = (ts) =>
-  new Intl.DateTimeFormat("en-GB", {
-    timeZone: TIMEZONE,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false
-  }).format(new Date(ts));
-const nowUK = () => ukDate(Date.now());
+// Send via the manual server-owned webhook URL using plain HTTP.
+// No discovery, no creation, no app-owned fallback.
+async function sendViaWebhook(channel, content) {
+  try {
+    // Only use the webhook in the configured channel; elsewhere, just normal send.
+    if (WEBHOOK_URL && channel.name.toLowerCase() === (process.env.WEBHOOK_CHANNEL_NAME || "bot-test").toLowerCase()) {
+      console.log(`[WEBHOOK] Sending via MANUAL webhook URL in #${channel.name}`);
+      // Use the webhook’s configured name/avatar. Do NOT override avatar/username here,
+      // to avoid any association with the application.
+      const res = await fetch(WEBHOOK_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          content,
+          allowed_mentions: { parse: [] }
+          // (intentionally NOT setting username or avatar_url;
+          // the webhook's own name & avatar will be used)
+        })
+      });
+      if (!res.ok) {
+        const txt = await res.text().catch(() => "");
+        console.warn(`[WEBHOOK] HTTP ${res.status}: ${txt}`);
+      }
+      return;
+    }
 
-const allowlist = (process.env.CHANNEL_NAME_ALLOWLIST || "")
-  .split(",")
-  .map(s => s.trim().toLowerCase())
-  .filter(Boolean);
-const allowlistSet = new Set(allowlist);
+    // Elsewhere, fall back to normal send (will show App badge).
+    console.log(`[WEBHOOK] Fallback normal send in #${channel.name}`);
+    return channel.send({ content, allowedMentions: { parse: [] } });
+  } catch (e) {
+    console.warn("[WEBHOOK] send error:", e?.message || e);
+    // Final fallback
+    return channel.send({ content, allowedMentions: { parse: [] } });
+  }
+}
 
 // ---------- Discord client ----------
 const client = new Client({
