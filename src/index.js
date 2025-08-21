@@ -215,35 +215,34 @@ async function aiReply(prompt) {
   }
 }
 
-// ---------- Webhook sending (manual URL ONLY to avoid App badge) ----------
+// ---------- Webhook sending (manual URL ONLY; no fallback except on HTTP failure) ----------
 async function sendViaWebhook(channel, content) {
+  const url = WEBHOOK_URL;
+  if (!url) {
+    console.warn("[WEBHOOK] WEBHOOK_URL missing — cannot send via webhook.");
+    return channel.send({ content, allowedMentions: { parse: [] } }); // will show App
+  }
+
   try {
-    const targetName = (process.env.WEBHOOK_CHANNEL_NAME || "bot-test").toLowerCase();
-    if (WEBHOOK_URL && channel.name.toLowerCase() === targetName) {
-      console.log(`[WEBHOOK] Sending via MANUAL webhook URL in #${channel.name}`);
-
-      // Use the webhook’s configured name/avatar (set in Integrations UI).
-      // Do NOT override username/avatar_url here; keeps it server-owned visually.
-      const res = await fetch(WEBHOOK_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          content,
-          allowed_mentions: { parse: [] }
-        })
-      });
-      if (!res.ok) {
-        const txt = await res.text().catch(() => "");
-        console.warn(`[WEBHOOK] HTTP ${res.status}: ${txt}`);
-      }
-      return;
+    console.log(`[WEBHOOK] FORCED manual webhook POST (ignoring channel), target UI name: ${WEBHOOK_CHANNEL_NAME}`);
+    // Use the webhook’s configured name/avatar (set in Integrations UI).
+    // Do NOT override username/avatar_url here; we want it purely server-owned visually.
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        content,
+        allowed_mentions: { parse: [] }
+      })
+    });
+    if (!res.ok) {
+      const txt = await res.text().catch(() => "");
+      console.warn(`[WEBHOOK] HTTP ${res.status}: ${txt}`);
     }
-
-    // Elsewhere, fall back to normal send (will show App badge)
-    console.log(`[WEBHOOK] Fallback normal send in #${channel.name}`);
-    return channel.send({ content, allowedMentions: { parse: [] } });
+    return;
   } catch (e) {
     console.warn("[WEBHOOK] send error:", e?.message || e);
+    // Only if webhook POST fails completely, use normal send (shows App)
     return channel.send({ content, allowedMentions: { parse: [] } });
   }
 }
@@ -268,7 +267,7 @@ async function idleSweep() {
         try {
           await ch.sendTyping();
           const prompt = `No one has chatted for a while in #${ch.name}. Create ONE short cheeky opener under 45 words and end with a question.`;
-        const ai = await aiReply(prompt);
+          const ai = await aiReply(prompt);
           const text = (ai || cheekyStarter(ch.name)).trim();
           await sendViaWebhook(ch, text);
           markStarter(ch.id);
@@ -290,6 +289,28 @@ client.once(Events.ClientReady, () => {
       .join(", ");
     console.log(`[ALLOWED in ${guild.name}]`, list || "(none)");
   }
+
+  // One-time webhook startup check (should appear in your channel with NO App badge)
+  (async () => {
+    try {
+      if (WEBHOOK_URL) {
+        console.log("[WEBHOOK] Sending startup check via MANUAL webhook URL");
+        await fetch(WEBHOOK_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            content: "✅ Webhook startup check: if you see this with NO App badge, you’re good.",
+            allowed_mentions: { parse: [] }
+          })
+        });
+      } else {
+        console.warn("[WEBHOOK] No WEBHOOK_URL set; cannot run startup check.");
+      }
+    } catch (e) {
+      console.warn("[WEBHOOK] Startup check failed:", e?.message || e);
+    }
+  })();
+
   setInterval(idleSweep, 60 * 1000).unref();
   buildKnowledgeBase(client).catch(e => console.error("[KB] build error", e));
 });
