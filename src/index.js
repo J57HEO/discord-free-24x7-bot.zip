@@ -48,7 +48,9 @@ function canSendInChannel(ch) {
     const me = ch.guild?.members?.me;
     const perms = ch.permissionsFor(me);
     return perms?.has(["ViewChannel","SendMessages","ReadMessageHistory"]);
-  } catch { return false; }
+  } catch {
+    return false;
+  }
 }
 
 const meta = new Map(); // channelId -> { lastMessageTs, lastStarterTs }
@@ -110,4 +112,73 @@ async function idleSweep() {
   const idleMs = IDLE_MINUTES * 60 * 1000;
   const cooldownMs = STARTER_COOLDOWN_MINUTES * 60 * 1000;
 
-  f
+  for (const [, guild] of client.guilds.cache) {
+    const channels = guild.channels.cache.filter(allowedChannel);
+    for (const [, ch] of channels) {
+      if (!canSendInChannel(ch)) continue;
+      const m = meta.get(ch.id) || {};
+      const lastMsg = m.lastMessageTs || 0;
+      const lastStarter = m.lastStarterTs || 0;
+      const idle = (now - lastMsg) > idleMs;
+      const cooled = (now - lastStarter) > cooldownMs;
+
+      if (idle && cooled) {
+        try {
+          await ch.sendTyping();
+          const prompt = `No one has chatted for a while in #${ch.name}. Create ONE short cheeky opener under 45 words and end with a question.`;
+          const ai = await aiReply(prompt);
+          const text = (ai || cheekyStarter(ch.name)).trim();
+          await ch.send({ content: text, allowedMentions: { parse: [] } });
+          markStarter(ch.id);
+        } catch (e) {
+          console.warn("starter failed for channel", ch.id, e?.message || e);
+        }
+      }
+    }
+  }
+}
+
+// ---------- Events ----------
+client.once(Events.ClientReady, () => {
+  console.log(`Logged in as ${client.user.tag}`);
+  for (const [, guild] of client.guilds.cache) {
+    const list = guild.channels.cache
+      .filter(allowedChannel)
+      .map(ch => `#${ch.name} (${ch.id})`)
+      .join(", ");
+    console.log(`[ALLOWED in ${guild.name}]`, list || "(none)");
+  }
+  setInterval(idleSweep, 60 * 1000).unref(); // check every minute
+});
+
+client.on(Events.MessageCreate, async (message) => {
+  try {
+    if (message.author.bot) return;
+    if (!allowedChannel(message.channel)) return;
+    if (!canSendInChannel(message.channel)) {
+      console.warn("[SKIP] missing perms in channel:", message.channel?.name);
+      return;
+    }
+
+    markMessage(message.channelId);
+
+    const content = (message.content || "").trim();
+    const mentioned = message.mentions.has(client.user);
+    const chance = isQuestion(content) ? REPLY_CHANCE_QUESTION : REPLY_CHANCE;
+
+    // Always reply if directly mentioned; otherwise probabilistic
+    if (!mentioned && Math.random() > chance) return;
+
+    await message.channel.sendTyping();
+
+    const prompt = `Channel: #${message.channel.name}. Be casual, witty, and kind.\nUser said: ${content.slice(0, 800)}`;
+    let out = await aiReply(prompt);
+    if (!out) out = "my brain just buffered 🤖💭—say that again?";
+
+    await message.channel.send({ content: out, allowedMentions: { parse: [] } });
+  } catch (e) {
+    console.error("on message error:", e?.message || e);
+  }
+});
+
+client.login(process.env.DISCORD_TOKEN);
