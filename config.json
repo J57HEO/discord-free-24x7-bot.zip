@@ -1,0 +1,10 @@
+{
+  "replyChance": 0.3,
+  "replyChanceIfQuestion": 0.85,
+  "idleMinutesBeforeStarter": 30,
+  "starterCooldownMinutes": 45,
+  "language": "en",
+  "channelNameAllowlist": [
+    "general-chat"
+  ]
+}
