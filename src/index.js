@@ -2,15 +2,13 @@ import "dotenv/config";
 import { Client, GatewayIntentBits, Partials, ChannelType, Events } from "discord.js";
 import OpenAI from "openai";
 
-// ---------- Config from env (with sensible defaults) ----------
+// ---------- Config ----------
 const REPLY_CHANCE = Number(process.env.REPLY_CHANCE) || 0.30;
 const REPLY_CHANCE_QUESTION = Number(process.env.REPLY_CHANCE_QUESTION) || 0.85;
 const IDLE_MINUTES = Number(process.env.IDLE_MINUTES) || 30;
 const STARTER_COOLDOWN_MINUTES = Number(process.env.STARTER_COOLDOWN_MINUTES) || 45;
 const LANGUAGE = process.env.LANGUAGE || "en";
 
-// Allowlist: comma-separated list of channel names (case-insensitive).
-// Leave empty to allow all non-NSFW text channels.
 const allowlist = (process.env.CHANNEL_NAME_ALLOWLIST || "")
   .split(",")
   .map(s => s.trim().toLowerCase())
@@ -27,7 +25,7 @@ const client = new Client({
   partials: [Partials.Channel, Partials.Message]
 });
 
-// ---------- OpenAI-compatible client (OpenRouter by default) ----------
+// ---------- OpenAI-compatible client ----------
 const aiClient = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY || process.env.OPENROUTER_API_KEY || "",
   baseURL: process.env.OPENAI_BASE_URL || "https://openrouter.ai/api/v1"
@@ -80,6 +78,91 @@ function cheekyStarter(channelName) {
   return picks[Math.floor(Math.random() * picks.length)];
 }
 
+// ---------- Knowledge Base ----------
+const KB = []; // {channelId, channelName, id, author, content, ts}
+
+function tokens(s) {
+  return (s || "")
+    .toLowerCase()
+    .replace(/[`*_~>#[\]()|\\]/g, " ")
+    .replace(/https?:\/\/\S+/g, " ")
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .split(/\s+/)
+    .filter(Boolean);
+}
+
+function scoreDoc(qTokens, doc) {
+  const dTokens = tokens(doc.content);
+  if (!dTokens.length) return 0;
+  let overlap = 0;
+  const set = new Set(dTokens);
+  for (const t of qTokens) if (set.has(t)) overlap++;
+  return overlap + (/\?/.test(doc.content) ? 0.2 : 0);
+}
+
+async function fetchHistory(ch, max = 800) {
+  const out = [];
+  let before;
+  while (out.length < max) {
+    const batch = await ch.messages.fetch({ limit: 100, ...(before ? { before } : {}) });
+    if (!batch.size) break;
+    for (const [, m] of batch) {
+      if (!m.content) continue;
+      out.push({
+        channelId: ch.id,
+        channelName: ch.name,
+        id: m.id,
+        author: m.author?.bot ? "bot" : (m.author?.username || "user"),
+        content: m.content.slice(0, 2000),
+        ts: m.createdTimestamp
+      });
+    }
+    before = batch.last()?.id;
+    if (!before) break;
+  }
+  return out;
+}
+
+async function buildKnowledgeBase(client) {
+  KB.length = 0;
+  const names = (process.env.KNOWLEDGE_CHANNELS || "").split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
+  if (!names.length) {
+    console.log("[KB] No KNOWLEDGE_CHANNELS set — skipping build");
+    return;
+  }
+  let budget = Number(process.env.KNOWLEDGE_MAX_MESSAGES) || 1500;
+  for (const [, guild] of client.guilds.cache) {
+    for (const [, ch] of guild.channels.cache) {
+      if (ch.type !== ChannelType.GuildText) continue;
+      if (!names.includes(ch.name.toLowerCase())) continue;
+      if (!canSendInChannel(ch)) continue;
+      try {
+        console.log(`[KB] Fetching from #${ch.name}…`);
+        const take = Math.min(800, budget);
+        const msgs = await fetchHistory(ch, take);
+        KB.push(...msgs);
+        budget -= msgs.length;
+        if (budget <= 0) break;
+      } catch (e) {
+        console.warn("[KB] failed on", ch.name, e?.message || e);
+      }
+    }
+  }
+  KB.sort((a,b) => b.ts - a.ts);
+  console.log(`[KB] Loaded ${KB.length} messages`);
+}
+
+function retrieveSnippets(question, k = 6) {
+  const qTokens = tokens(question);
+  const scored = KB
+    .map(d => ({ d, s: scoreDoc(qTokens, d) }))
+    .filter(x => x.s > 0)
+    .sort((a,b) => b.s - a.s)
+    .slice(0, k)
+    .map(x => x.d);
+  return scored.map(d => `[#${d.channelName}] ${new Date(d.ts).toISOString().split("T")[0]} — ${d.content}`).join("\n\n");
+}
+
 // ---------- AI reply ----------
 async function aiReply(prompt) {
   try {
@@ -102,7 +185,7 @@ async function aiReply(prompt) {
     return res.choices?.[0]?.message?.content?.trim() || "";
   } catch (e) {
     console.error("AI error:", e?.status || e?.code || e?.message);
-    return ""; // fall back handled by caller
+    return "";
   }
 }
 
@@ -148,7 +231,8 @@ client.once(Events.ClientReady, () => {
       .join(", ");
     console.log(`[ALLOWED in ${guild.name}]`, list || "(none)");
   }
-  setInterval(idleSweep, 60 * 1000).unref(); // check every minute
+  setInterval(idleSweep, 60 * 1000).unref();
+  buildKnowledgeBase(client).catch(e => console.error("[KB] build error", e));
 });
 
 client.on(Events.MessageCreate, async (message) => {
@@ -166,12 +250,19 @@ client.on(Events.MessageCreate, async (message) => {
     const mentioned = message.mentions.has(client.user);
     const chance = isQuestion(content) ? REPLY_CHANCE_QUESTION : REPLY_CHANCE;
 
-    // Always reply if directly mentioned; otherwise probabilistic
     if (!mentioned && Math.random() > chance) return;
 
     await message.channel.sendTyping();
 
-    const prompt = `Channel: #${message.channel.name}. Be casual, witty, and kind.\nUser said: ${content.slice(0, 800)}`;
+    let kbBlock = "";
+    if (KB.length && isQuestion(content)) {
+      const snips = retrieveSnippets(content, 6);
+      if (snips) {
+        kbBlock = `\n\nPROJECT NOTES (from Discord):\n${snips}\n\nAnswer ONLY using the notes above. If the answer isn't in the notes, say you don't have that info yet.`;
+      }
+    }
+
+    const prompt = `Channel: #${message.channel.name}. Be casual, witty, and kind.\nUser said: ${content.slice(0, 800)}${kbBlock}`;
     let out = await aiReply(prompt);
     if (!out) out = "my brain just buffered 🤖💭—say that again?";
 
