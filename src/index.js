@@ -20,8 +20,11 @@ const TIMEZONE = process.env.TIMEZONE || "Europe/London";     // GMT/BST
 if (!process.env.TZ) process.env.TZ = TIMEZONE;               // make Node use UK time
 
 // Models
-const MODEL = process.env.MODEL || "deepseek/deepseek-r1:free";
+const MODEL = process.env.MODEL || "openrouter/auto";
 const FALLBACK_MODEL = process.env.MODEL_FALLBACK || "openrouter/auto"; // robust fallback
+
+// Throttle for AI (reduce 429s)
+const THROTTLE_MS = Number(process.env.AI_THROTTLE_MS) || 6000;
 
 // Tenor (GIFs)
 const TENOR_API_KEY = process.env.TENOR_API_KEY || "";
@@ -38,10 +41,17 @@ const STICKER_BROADCAST_INTERVAL_MIN = Number(process.env.STICKER_BROADCAST_INTE
 const STICKER_BROADCAST_JITTER_MIN = Number(process.env.STICKER_BROADCAST_JITTER_MIN) || 12; // +/- jitter
 const STICKER_BROADCAST_IDLE_GUARD_MIN = Number(process.env.STICKER_BROADCAST_IDLE_GUARD_MIN) || 15;
 
+// Idle AI usage flag (disable to save tokens)
+const STARTER_USE_AI = String(process.env.STARTER_USE_AI || "false").toLowerCase() === "true";
+
 // Allowed chat channels
 const allowlist = (process.env.CHANNEL_NAME_ALLOWLIST || "")
   .split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
 const allowlistSet = new Set(allowlist);
+
+// Optional: provide knowledge channels by ID to avoid name mismatches
+const KB_ID_LIST = (process.env.KNOWLEDGE_CHANNEL_IDS || "")
+  .split(",").map(s => s.trim()).filter(Boolean);
 
 // ---------- Utilities ----------
 const ukDate = (ts) =>
@@ -88,7 +98,6 @@ function isQuestion(text) {
   return /\?$/.test(text) || /\b(why|how|what|where|who|when|which|can|do|does|did|is|are|will|should)\b/i.test(text);
 }
 function looksLikeGifRequest(text) {
-  const t = text.toLowerCase();
   return (
     /^gif[:\s]/i.test(text) ||
     /\bsend (me )?a gif of\b/i.test(text) ||
@@ -141,7 +150,6 @@ function cheekyStarter(channelName) {
     `Autumn vibes: what’s your comfort watch/read right now? 🍂`,
     `What’s one small goal you want to close out strong this month? ✅`
   ];
-
   const all = [...base, ...seasonal];
   const weekIndex = Math.floor(Date.now() / (7 * 24 * 60 * 60 * 1000));
   return all[weekIndex % all.length];
@@ -159,20 +167,16 @@ function tokens(s) {
     .split(/\s+/)
     .filter(Boolean);
 }
-
 function scoreDoc(qTokens, doc) {
   const dTokens = tokens(doc.content);
   if (!dTokens.length) return 0;
   let overlap = 0;
   const set = new Set(dTokens);
   for (const t of qTokens) if (set.has(t)) overlap++;
-
   const days = (Date.now() - doc.ts) / (24*60*60*1000);
   const recencyBoost = days <= KB_RECENCY_BOOST_DAYS ? 0.5 : 0;
-
   return overlap + recencyBoost;
 }
-
 async function fetchHistory(ch, max = 800) {
   const out = [];
   let before;
@@ -196,23 +200,27 @@ async function fetchHistory(ch, max = 800) {
   }
   return out;
 }
-
 async function buildKnowledgeBase(client) {
   KB.length = 0;
-  const names = (process.env.KNOWLEDGE_CHANNELS || "")
-    .split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
 
-  if (!names.length) {
-    console.log("[KB] No KNOWLEDGE_CHANNELS set — skipping build");
+  const nameTargets = (process.env.KNOWLEDGE_CHANNELS || "")
+    .split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
+  const idTargets = new Set(KB_ID_LIST);
+
+  console.log("[KB] Target names:", nameTargets.length ? nameTargets.join(", ") : "(none)");
+  console.log("[KB] Target IDs  :", idTargets.size ? [...idTargets].join(", ") : "(none)");
+
+  if (!nameTargets.length && !idTargets.size) {
+    console.log("[KB] No knowledge channels configured — skipping.");
     return;
   }
 
   for (const [, guild] of client.guilds.cache) {
     console.log(`[KB] Scanning guild: ${guild.name}`);
+
     let channels;
     try {
-      // fetch from API to avoid stale cache
-      channels = await guild.channels.fetch();
+      channels = await guild.channels.fetch(); // fetch from API for freshness
     } catch (e) {
       console.warn("[KB] Could not fetch channels for guild:", guild.name, e?.message || e);
       continue;
@@ -220,22 +228,24 @@ async function buildKnowledgeBase(client) {
 
     for (const [, ch] of channels) {
       if (!ch || ch.type !== ChannelType.GuildText) continue;
+
       const cname = (ch.name || "").toLowerCase();
-      const target = names.includes(cname);
-      if (!target) continue;
+      const isNameTarget = nameTargets.includes(cname);
+      const isIdTarget = idTargets.has(ch.id);
+      if (!isNameTarget && !isIdTarget) continue;
 
-      const canRead = canReadChannel(ch);
-      console.log(`[KB] Candidate #${ch.name}: target=${target} canRead=${!!canRead}`);
+      const readable = canReadChannel(ch);
+      console.log(`[KB] Candidate #${ch.name} (${ch.id}) — nameMatch=${isNameTarget} idMatch=${isIdTarget} readable=${readable}`);
 
-      if (!canRead) {
-        console.warn(`[KB] Missing read perms for #${ch.name} — need View Channel + Read Message History`);
+      if (!readable) {
+        console.warn(`[KB] Missing perms for #${ch.name}: need View Channel + Read Message History`);
         continue;
       }
 
       try {
-        const take = Math.min(800, Number(process.env.KNOWLEDGE_MAX_MESSAGES) || 1500);
-        const msgs = await fetchHistory(ch, take);
-        console.log(`[KB] #${ch.name}: fetched ${msgs.length} messages`);
+        const perChannelMax = Math.min(800, Number(process.env.KNOWLEDGE_MAX_MESSAGES) || 1500);
+        const msgs = await fetchHistory(ch, perChannelMax);
+        console.log(`[KB] #${ch.name}: fetched ${msgs.length}`);
         KB.push(...msgs);
       } catch (e) {
         console.warn("[KB] fetchHistory failed on", ch.name, e?.message || e);
@@ -246,16 +256,16 @@ async function buildKnowledgeBase(client) {
   KB.sort((a, b) => b.ts - a.ts);
   console.log(`[KB] Loaded ${KB.length} messages`);
 }
-
 function retrieveSnippets(question, k = KB_MAX_SNIPPETS) {
   const qTokens = tokens(question);
+  if (!KB.length || !qTokens.length) return "";
   const scored = KB
     .map(d => ({ d, s: scoreDoc(qTokens, d) }))
     .filter(x => x.s >= KB_MIN_SCORE)
     .sort((a, b) => b.s - a.s)
     .slice(0, k)
     .map(x => x.d);
-
+  if (!scored.length) return "";
   return scored
     .map(d => `[#${d.channelName}] ${ukDate(d.ts)} — ${d.content}`)
     .join("\n\n");
@@ -266,9 +276,6 @@ const aiClient = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY || process.env.OPENROUTER_API_KEY || "",
   baseURL: process.env.OPENAI_BASE_URL || "https://openrouter.ai/api/v1"
 });
-
-// simple global throttle: 1 call per THROTTLE_MS
-const THROTTLE_MS = Number(process.env.AI_THROTTLE_MS) || 3000;
 let lastCallAt = 0;
 async function throttle() {
   const now = Date.now();
@@ -278,7 +285,6 @@ async function throttle() {
   }
   lastCallAt = Date.now();
 }
-
 async function modelCall(model, messages) {
   await throttle();
   return aiClient.chat.completions.create({
@@ -288,7 +294,6 @@ async function modelCall(model, messages) {
     messages
   });
 }
-
 async function aiReply(prompt, kbText) {
   const sys = `You are "CheekyBuddy", a friendly, funny, cheeky (but kind) Discord pal.
 - Use UK English.
@@ -296,7 +301,6 @@ async function aiReply(prompt, kbText) {
 - Keep replies under ~90 words. No @here/@everyone. End with a complete sentence.`;
 
   const grounded = !!kbText;
-
   const userMsg = grounded
     ? `Answer the user's question ONLY using the PROJECT NOTES below.
 If the notes don't contain the answer, say briefly you don't have that info yet and suggest where to look (e.g., #official-links).
@@ -312,7 +316,7 @@ ${kbText}`
   const messages = [
     { role: "system", content: sys },
     { role: "user", content: userMsg },
-    { role: "system", content: `Language: ${LANGUAGE}. Answer the question directly first. If grounded, do not invent info.` }
+    { role: "system", content: `Language: ${LANGUAGE}. Answer directly first. If grounded, do not invent info.` }
   ];
 
   // primary with retry/backoff on 429
@@ -370,7 +374,6 @@ async function fetchGif(query) {
 
 // ---------- Stickers (server-owned only) ----------
 const guildStickers = new Map(); // guildId -> array of sticker objects
-
 async function loadGuildStickers(guild) {
   try {
     const coll = await guild.stickers.fetch();
@@ -382,7 +385,6 @@ async function loadGuildStickers(guild) {
     guildStickers.set(guild.id, []);
   }
 }
-
 function pickRandomSticker(guildId) {
   const list = guildStickers.get(guildId) || [];
   if (!list.length) return null;
@@ -433,8 +435,13 @@ Tone: positive, inclusive, playful.
 Avoid words like quiet, dead, crickets, ghost town, or calling people out.
 End with a friendly question that invites anyone to jump in.`;
 
-            const ai = await aiReply(prompt, null);
-            const text = (ai || cheekyStarter(ch.name)).trim();
+            let text = cheekyStarter(ch.name);
+            if (STARTER_USE_AI) {
+              const ai = await aiReply(prompt, null);
+              text = (ai || text).trim();
+            } else {
+              text = text.trim();
+            }
 
             if (lastReplies.get(ch.id) === text) return;
 
