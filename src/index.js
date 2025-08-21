@@ -8,21 +8,24 @@ import {
 } from "discord.js";
 import OpenAI from "openai";
 
-// ---------- Config ----------
+// ---------- Config (env-driven) ----------
 const REPLY_CHANCE = Number(process.env.REPLY_CHANCE) || 0.30;
 const REPLY_CHANCE_QUESTION = Number(process.env.REPLY_CHANCE_QUESTION) || 0.85;
 const IDLE_MINUTES = Number(process.env.IDLE_MINUTES) || 30;
 const STARTER_COOLDOWN_MINUTES = Number(process.env.STARTER_COOLDOWN_MINUTES) || 45;
 
-// UK language & timezone
-const LANGUAGE = process.env.LANGUAGE || "en-GB";
-const TIMEZONE = process.env.TIMEZONE || "Europe/London";
-if (!process.env.TZ) process.env.TZ = TIMEZONE; // ensure Node uses UK time
+const LANGUAGE = process.env.LANGUAGE || "en-GB";            // UK English
+const TIMEZONE = process.env.TIMEZONE || "Europe/London";     // GMT/BST
+if (!process.env.TZ) process.env.TZ = TIMEZONE;               // make Node use UK time
 
-// Webhook: manual (server-owned) URL to avoid App badge
-const WEBHOOK_URL = process.env.WEBHOOK_URL || "";
-const WEBHOOK_CHANNEL_NAME = (process.env.WEBHOOK_CHANNEL_NAME || "bot-test").toLowerCase();
+const MODEL = process.env.MODEL || "deepseek/deepseek-r1:free";
+const FALLBACK_MODEL = process.env.MODEL_FALLBACK || "openrouter/auto"; // set your preferred fallback
 
+const allowlist = (process.env.CHANNEL_NAME_ALLOWLIST || "")
+  .split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
+const allowlistSet = new Set(allowlist);
+
+// ---------- Utilities ----------
 const ukDate = (ts) =>
   new Intl.DateTimeFormat("en-GB", {
     timeZone: TIMEZONE,
@@ -35,30 +38,6 @@ const ukDate = (ts) =>
   }).format(new Date(ts));
 const nowUK = () => ukDate(Date.now());
 
-const allowlist = (process.env.CHANNEL_NAME_ALLOWLIST || "")
-  .split(",")
-  .map(s => s.trim().toLowerCase())
-  .filter(Boolean);
-const allowlistSet = new Set(allowlist);
-
-// ---------- Discord client ----------
-const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent
-  ],
-  partials: [Partials.Channel, Partials.Message]
-});
-
-// ---------- OpenAI-compatible client ----------
-const aiClient = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY || process.env.OPENROUTER_API_KEY || "",
-  baseURL: process.env.OPENAI_BASE_URL || "https://openrouter.ai/api/v1"
-});
-const MODEL = process.env.MODEL || "deepseek/deepseek-r1:free";
-
-// ---------- Helpers ----------
 function allowedChannel(ch) {
   if (!ch) return false;
   if (ch.type !== ChannelType.GuildText) return false;
@@ -66,15 +45,17 @@ function allowedChannel(ch) {
   if (allowlistSet.size && !allowlistSet.has(ch.name.toLowerCase())) return false;
   return true;
 }
+
 function canSendInChannel(ch) {
   try {
     const me = ch.guild?.members?.me;
     const perms = ch.permissionsFor(me);
-    return perms?.has(["ViewChannel", "SendMessages", "ReadMessageHistory"]);
+    return perms?.has(["ViewChannel","SendMessages","ReadMessageHistory"]);
   } catch { return false; }
 }
 
 const meta = new Map(); // channelId -> { lastMessageTs, lastStarterTs }
+const lastReplies = new Map(); // channelId -> last bot message (to avoid repeating)
 function markMessage(cid) {
   const m = meta.get(cid) || {};
   m.lastMessageTs = Date.now();
@@ -85,18 +66,53 @@ function markStarter(cid) {
   m.lastStarterTs = Date.now();
   meta.set(cid, m);
 }
+
 function isQuestion(text) {
   return /\?$/.test(text) || /\b(why|how|what|where|who|when)\b/i.test(text);
 }
+
+// ---------- Positive, upbeat starters (with seasonal/weekly rotation) ----------
 function cheekyStarter(channelName) {
-  const picks = [
-    `Right, it's gone suspiciously quiet in #${channelName}… what's everyone up to today?`,
-    `Tea or coffee — and why? ☕️`,
-    `Tiny wins check: what's one small thing that made your week better?`,
-    `If you could add one emoji to the keyboard, what would it be?`,
-    `Confession time: what's your mildly controversial food take?`
+  const base = [
+    `Hey #${channelName}, quick vibe check — what’s one good thing that happened today? ✨`,
+    `Alright team, share a tiny win from this week — big or small, it counts! 🙌`,
+    `Tea break chat: what are you sipping right now and why is it elite? ☕️`,
+    `If you could add one feature to our project today, what would it be (dream big)? 💡`,
+    `Two-minute poll: morning person or night owl — what makes it work for you? 🌅🦉`,
+    `Shout-out time: who deserves a mini high-five and for what? 👏`,
+    `Drop a GIF that matches your current mood — no overthinking. 🎬`,
+    `What’s one thing you’re curious about this week? Let’s nerd out together. 🔍`,
+    `Your soundtrack right now: song/artist? I’m hunting for new tunes. 🎧`,
+    `Pick one: tea dunkers vs non-dunkers — sell me your case in 10 words. 😄`
   ];
-  return picks[Math.floor(Math.random() * picks.length)];
+
+  const month = Number(new Intl.DateTimeFormat("en-GB", { timeZone: TIMEZONE, month: "numeric" }).format(new Date()));
+  let seasonal = [];
+  if ([12,1,2].includes(month)) {
+    seasonal = [
+      `Winter warmers: what’s your go-to cosy drink or snack? ❄️`,
+      `What’s one thing you’re aiming to learn before spring? 🌱`
+    ];
+  } else if ([3,4,5].includes(month)) {
+    seasonal = [
+      `Spring energy: what fresh start are you making this month? 🌼`,
+      `What tiny habit is giving you big results lately? ✨`
+    ];
+  } else if ([6,7,8].includes(month)) {
+    seasonal = [
+      `Summer picks: iced coffee or classic brew — and why? 🧊☕`,
+      `Holiday mode on or off — what’s your next mini escape? 🏖️`
+    ];
+  } else {
+    seasonal = [
+      `Autumn vibes: what’s your comfort watch/read right now? 🍂`,
+      `What’s one small goal you want to close out strong this month? ✅`
+    ];
+  }
+
+  const all = [...base, ...seasonal];
+  const weekIndex = Math.floor(Date.now() / (7 * 24 * 60 * 60 * 1000));
+  return all[weekIndex % all.length];
 }
 
 // ---------- Knowledge Base (reads Discord channels you specify) ----------
@@ -154,7 +170,7 @@ async function buildKnowledgeBase(client) {
     for (const [, ch] of guild.channels.cache) {
       if (ch.type !== ChannelType.GuildText) continue;
       if (!names.includes(ch.name.toLowerCase())) continue;
-      if (!canSendInChannel(ch)) continue; // ensures bot can view/read
+      if (!canSendInChannel(ch)) continue;
       try {
         console.log(`[KB] Fetching from #${ch.name}…`);
         const take = Math.min(800, budget);
@@ -183,68 +199,60 @@ function retrieveSnippets(question, k = 6) {
     .join("\n\n");
 }
 
-// ---------- AI reply ----------
-async function aiReply(prompt) {
-  try {
-    const sys = `You are "CheekyBuddy", a friendly, funny, cheeky (but kind) Discord pal.
+// ---------- OpenAI client ----------
+const aiClient = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY || process.env.OPENROUTER_API_KEY || "",
+  baseURL: process.env.OPENAI_BASE_URL || "https://openrouter.ai/api/v1"
+});
+
+// Robust AI call with retry + fallback
+async function modelCall(model, prompt) {
+  return aiClient.chat.completions.create({
+    model,
+    temperature: 0.75,
+    max_tokens: 500, // plenty of headroom; we still ask for short replies
+    messages: [
+      {
+        role: "system",
+        content: `You are "CheekyBuddy", a friendly, funny, cheeky (but kind) Discord pal.
 - Use UK English.
 - Assume timezone Europe/London (UK). Handle daylight savings (GMT/BST) automatically.
 - Current UK date/time is: ${nowUK()} (DD/MM/YYYY HH:mm). If asked "what time is it", use exactly this value.
-- Use UK formats for dates/times: DD/MM/YYYY and 24-hour clock (e.g., 17:30).
-- Never say you're an AI. Keep it light, inclusive, and SFW.
-- Avoid @here/@everyone. Keep replies under ~90 words.
-- End your response with a complete sentence.`;
-
-    const res = await aiClient.chat.completions.create({
-      model: MODEL,
-      temperature: 0.75,
-      max_tokens: 400,
-      messages: [
-        { role: "system", content: sys },
-        { role: "user", content: prompt || "Say hi in a fun cheeky way." },
-        { role: "system", content: `Keep replies concise. Language: ${LANGUAGE}.` }
-      ]
-    });
-
-    let out = res.choices?.[0]?.message?.content?.trim() || "";
-    if (out && !/[.!?]$/.test(out)) out += ".";
-    return out;
-  } catch (e) {
-    console.error("AI error:", e?.status || e?.code || e?.message);
-    return "";
-  }
+- Use UK date/time formats (DD/MM/YYYY, 24-hour clock).
+- Keep replies under ~90 words. No @here/@everyone. Finish with a complete sentence.`
+      },
+      { role: "user", content: prompt || "Say hi in a fun cheeky way." },
+      { role: "system", content: `Language: ${LANGUAGE}. Be concise, inclusive, SFW.` }
+    ]
+  });
 }
 
-// ---------- Webhook sending (manual URL ONLY; no fallback except on HTTP failure) ----------
-async function sendViaWebhook(channel, content) {
-  const url = WEBHOOK_URL;
-  if (!url) {
-    console.warn("[WEBHOOK] WEBHOOK_URL missing — cannot send via webhook.");
-    return channel.send({ content, allowedMentions: { parse: [] } }); // will show App
+async function aiReply(prompt) {
+  // Try primary model
+  try {
+    const res = await modelCall(MODEL, prompt);
+    let out = res?.choices?.[0]?.message?.content?.trim() || "";
+    if (out && !/[.!?]$/.test(out)) out += ".";
+    if (out) return out;
+  } catch (e) {
+    console.warn("[AI] Primary model failed:", e?.status || e?.code || e?.message);
+    // small backoff for rate limits
+    if (e?.status === 429 || e?.code === "insufficient_quota") {
+      await new Promise(r => setTimeout(r, 1200));
+    }
   }
 
+  // Try fallback model
   try {
-    console.log(`[WEBHOOK] FORCED manual webhook POST (ignoring channel), target UI name: ${WEBHOOK_CHANNEL_NAME}`);
-    // Use the webhook’s configured name/avatar (set in Integrations UI).
-    // Do NOT override username/avatar_url here; we want it purely server-owned visually.
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        content,
-        allowed_mentions: { parse: [] }
-      })
-    });
-    if (!res.ok) {
-      const txt = await res.text().catch(() => "");
-      console.warn(`[WEBHOOK] HTTP ${res.status}: ${txt}`);
-    }
-    return;
-  } catch (e) {
-    console.warn("[WEBHOOK] send error:", e?.message || e);
-    // Only if webhook POST fails completely, use normal send (shows App)
-    return channel.send({ content, allowedMentions: { parse: [] } });
+    const res2 = await modelCall(FALLBACK_MODEL, prompt);
+    let out2 = res2?.choices?.[0]?.message?.content?.trim() || "";
+    if (out2 && !/[.!?]$/.test(out2)) out2 += ".";
+    if (out2) return out2;
+  } catch (e2) {
+    console.warn("[AI] Fallback model failed:", e2?.status || e2?.code || e2?.message);
   }
+
+  return ""; // caller will do a smart deterministic fallback
 }
 
 // ---------- Idle starter ----------
@@ -266,10 +274,19 @@ async function idleSweep() {
       if (idle && cooled) {
         try {
           await ch.sendTyping();
-          const prompt = `No one has chatted for a while in #${ch.name}. Create ONE short cheeky opener under 45 words and end with a question.`;
+          const prompt = `Create ONE short, upbeat, welcoming opener for #${ch.name} (max 45 words).
+Tone: positive, inclusive, playful.
+Avoid words like quiet, dead, crickets, ghost town, or calling people out.
+End with a friendly question that invites anyone to jump in.`;
+
           const ai = await aiReply(prompt);
           const text = (ai || cheekyStarter(ch.name)).trim();
-          await sendViaWebhook(ch, text);
+
+          // avoid repeating exactly the same line back-to-back
+          if (lastReplies.get(ch.id) === text) return;
+
+          await ch.send({ content: text, allowedMentions: { parse: [] } });
+          lastReplies.set(ch.id, text);
           markStarter(ch.id);
         } catch (e) {
           console.warn("starter failed for channel", ch.id, e?.message || e);
@@ -279,7 +296,16 @@ async function idleSweep() {
   }
 }
 
-// ---------- Events ----------
+// ---------- Discord client ----------
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent
+  ],
+  partials: [Partials.Channel, Partials.Message]
+});
+
 client.once(Events.ClientReady, () => {
   console.log(`Logged in as ${client.user.tag}`);
   for (const [, guild] of client.guilds.cache) {
@@ -289,28 +315,6 @@ client.once(Events.ClientReady, () => {
       .join(", ");
     console.log(`[ALLOWED in ${guild.name}]`, list || "(none)");
   }
-
-  // One-time webhook startup check (should appear in your channel with NO App badge)
-  (async () => {
-    try {
-      if (WEBHOOK_URL) {
-        console.log("[WEBHOOK] Sending startup check via MANUAL webhook URL");
-        await fetch(WEBHOOK_URL, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            content: "✅ Webhook startup check: if you see this with NO App badge, you’re good.",
-            allowed_mentions: { parse: [] }
-          })
-        });
-      } else {
-        console.warn("[WEBHOOK] No WEBHOOK_URL set; cannot run startup check.");
-      }
-    } catch (e) {
-      console.warn("[WEBHOOK] Startup check failed:", e?.message || e);
-    }
-  })();
-
   setInterval(idleSweep, 60 * 1000).unref();
   buildKnowledgeBase(client).catch(e => console.error("[KB] build error", e));
 });
@@ -335,7 +339,7 @@ client.on(Events.MessageCreate, async (message) => {
 
     await message.channel.sendTyping();
 
-    // Pull project snippets if it's a question
+    // Retrieve project snippets if it's a question
     let kbBlock = "";
     if (KB.length && isQuestion(content)) {
       const snips = retrieveSnippets(content, 6);
@@ -344,11 +348,29 @@ client.on(Events.MessageCreate, async (message) => {
       }
     }
 
-    const prompt = `Channel: #${message.channel.name}. Be casual, witty, and kind.\nUser said: ${content.slice(0, 800)}${kbBlock}`;
-    let out = await aiReply(prompt);
-    if (!out) out = "my brain just buffered 🤖💭—say that again?";
+    const prompt = `Channel: #${message.channel.name}. Be casual, witty, and kind.
+User said: ${content.slice(0, 800)}${kbBlock}`;
 
-    await sendViaWebhook(message.channel, out);
+    let out = await aiReply(prompt);
+
+    // Smart deterministic fallback if AI returns empty
+    if (!out) {
+      if (KB.length && isQuestion(content)) {
+        const snip = retrieveSnippets(content, 1);
+        if (snip) {
+          out = `From the project notes:\n${snip}\n\nIf you need more detail, check the pinned links and #official-links.`;
+        }
+      }
+      if (!out) out = "I’m having a moment — try that again and I’ll give you a proper answer.";
+    }
+
+    // avoid repeating the same reply back-to-back
+    if (lastReplies.get(message.channelId) === out) {
+      out += " (and yes, I did read that twice!)";
+    }
+
+    await message.channel.send({ content: out, allowedMentions: { parse: [] } });
+    lastReplies.set(message.channelId, out);
   } catch (e) {
     console.error("on message error:", e?.message || e);
   }
