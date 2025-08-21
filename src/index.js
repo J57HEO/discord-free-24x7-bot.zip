@@ -1,16 +1,40 @@
 import "dotenv/config";
 import { Client, GatewayIntentBits, Partials, ChannelType, Events } from "discord.js";
+import OpenAI from "openai";
 
-const DEBUG_ECHO = process.env.DEBUG_ECHO === "1";
+// ---------- Config from env (with sensible defaults) ----------
+const REPLY_CHANCE = Number(process.env.REPLY_CHANCE) || 0.30;
+const REPLY_CHANCE_QUESTION = Number(process.env.REPLY_CHANCE_QUESTION) || 0.85;
+const IDLE_MINUTES = Number(process.env.IDLE_MINUTES) || 30;
+const STARTER_COOLDOWN_MINUTES = Number(process.env.STARTER_COOLDOWN_MINUTES) || 45;
+const LANGUAGE = process.env.LANGUAGE || "en";
+
+// Allowlist: comma-separated list of channel names (case-insensitive).
+// Leave empty to allow all non-NSFW text channels.
 const allowlist = (process.env.CHANNEL_NAME_ALLOWLIST || "")
-  .split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
+  .split(",")
+  .map(s => s.trim().toLowerCase())
+  .filter(Boolean);
 const allowlistSet = new Set(allowlist);
 
+// ---------- Discord client ----------
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent
+  ],
   partials: [Partials.Channel, Partials.Message]
 });
 
+// ---------- OpenAI-compatible client (OpenRouter by default) ----------
+const aiClient = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY || process.env.OPENROUTER_API_KEY || "",
+  baseURL: process.env.OPENAI_BASE_URL || "https://openrouter.ai/api/v1"
+});
+const MODEL = process.env.MODEL || "deepseek/deepseek-r1:free";
+
+// ---------- Helpers ----------
 function allowedChannel(ch) {
   if (!ch) return false;
   if (ch.type !== ChannelType.GuildText) return false;
@@ -18,6 +42,7 @@ function allowedChannel(ch) {
   if (allowlistSet.size && !allowlistSet.has(ch.name.toLowerCase())) return false;
   return true;
 }
+
 function canSendInChannel(ch) {
   try {
     const me = ch.guild?.members?.me;
@@ -26,42 +51,63 @@ function canSendInChannel(ch) {
   } catch { return false; }
 }
 
-client.once(Events.ClientReady, () => {
-  console.log(`Logged in as ${client.user.tag}`);
-  // List allowed channels at startup
-  for (const [, guild] of client.guilds.cache) {
-    const list = guild.channels.cache.filter(allowedChannel).map(ch => `#${ch.name} (${ch.id})`).join(", ");
-    console.log(`[ALLOWED in ${guild.name}]`, list || "(none)");
-  }
-  // Heartbeat log every 10s so we know logs are streaming
-});
+const meta = new Map(); // channelId -> { lastMessageTs, lastStarterTs }
+function markMessage(cid) {
+  const m = meta.get(cid) || {};
+  m.lastMessageTs = Date.now();
+  meta.set(cid, m);
+}
+function markStarter(cid) {
+  const m = meta.get(cid) || {};
+  m.lastStarterTs = Date.now();
+  meta.set(cid, m);
+}
 
-client.on(Events.MessageCreate, async (message) => {
+function isQuestion(text) {
+  return /\?$/.test(text) || /\b(why|how|what|where|who|when)\b/i.test(text);
+}
+
+function cheekyStarter(channelName) {
+  const picks = [
+    `Right, it's gone suspiciously quiet in #${channelName}… what's everyone up to today?`,
+    `Tea or coffee — and why? ☕️`,
+    `Tiny wins check: what's one small thing that made your week better?`,
+    `If you could add one emoji to the keyboard, what would it be?`,
+    `Confession time: what's your mildly controversial food take?`
+  ];
+  return picks[Math.floor(Math.random() * picks.length)];
+}
+
+// ---------- AI reply ----------
+async function aiReply(prompt) {
   try {
-    if (message.author.bot) return;
-    if (!allowedChannel(message.channel)) return;
-    if (!canSendInChannel(message.channel)) {
-      console.warn("[SKIP] missing perms in channel:", message.channel?.name);
-      return;
-    }
+    const sys = `You are "CheekyBuddy", a friendly, funny, cheeky (but kind) Discord pal.
+- UK English, short punchy replies, emojis OK.
+- Never say you're an AI. Keep it light, inclusive, and SFW.
+- Avoid @here/@everyone. Keep replies under ~90 words.`;
 
-    // Always echo in debug, so we 100% see a reply without AI
-    if (DEBUG_ECHO) {
-      await message.channel.send({ content: `ECHO: ${message.content || "(no text)"}`, allowedMentions: { parse: [] } });
-      return;
-    }
+    const res = await aiClient.chat.completions.create({
+      model: MODEL,
+      temperature: 0.8,
+      max_tokens: 280,
+      messages: [
+        { role: "system", content: sys },
+        { role: "user", content: prompt || "Say hi in a fun cheeky way." },
+        { role: "system", content: `Keep replies concise. Language: ${LANGUAGE}.` }
+      ]
+    });
 
-    // Normal (chance-based) fallback if debug off
-    const content = (message.content || "").trim();
-    const isQuestion = /\?$/.test(content) || /\b(why|how|what|where|who|when)\b/i.test(content);
-    const chance = isQuestion ? (Number(process.env.REPLY_CHANCE_QUESTION) || 0.85) : (Number(process.env.REPLY_CHANCE) || 0.30);
-    if (Math.random() > chance && !message.mentions.has(client.user)) return;
-
-    await message.channel.sendTyping();
-    await message.channel.send({ content: "my brain just buffered 🤖💭—say that again?", allowedMentions: { parse: [] } });
+    return res.choices?.[0]?.message?.content?.trim() || "";
   } catch (e) {
-    console.error("on message error:", e?.message || e);
+    console.error("AI error:", e?.status || e?.code || e?.message);
+    return ""; // fall back handled by caller
   }
-});
+}
 
-client.login(process.env.DISCORD_TOKEN);
+// ---------- Idle starter ----------
+async function idleSweep() {
+  const now = Date.now();
+  const idleMs = IDLE_MINUTES * 60 * 1000;
+  const cooldownMs = STARTER_COOLDOWN_MINUTES * 60 * 1000;
+
+  f
