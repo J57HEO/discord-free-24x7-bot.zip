@@ -7,7 +7,20 @@ const REPLY_CHANCE = Number(process.env.REPLY_CHANCE) || 0.30;
 const REPLY_CHANCE_QUESTION = Number(process.env.REPLY_CHANCE_QUESTION) || 0.85;
 const IDLE_MINUTES = Number(process.env.IDLE_MINUTES) || 30;
 const STARTER_COOLDOWN_MINUTES = Number(process.env.STARTER_COOLDOWN_MINUTES) || 45;
-const LANGUAGE = process.env.LANGUAGE || "en";
+const LANGUAGE = process.env.LANGUAGE || "en-GB"; // UK English by default
+
+// UK time / timezone
+const TIMEZONE = process.env.TIMEZONE || "Europe/London";
+const ukDate = (ts) =>
+  new Intl.DateTimeFormat("en-GB", {
+    timeZone: TIMEZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false
+  }).format(new Date(ts));
 
 const allowlist = (process.env.CHANNEL_NAME_ALLOWLIST || "")
   .split(",")
@@ -78,7 +91,7 @@ function cheekyStarter(channelName) {
   return picks[Math.floor(Math.random() * picks.length)];
 }
 
-// ---------- Knowledge Base ----------
+// ---------- Knowledge Base (reads Discord channels you specify) ----------
 const KB = []; // {channelId, channelName, id, author, content, ts}
 
 function tokens(s) {
@@ -125,7 +138,10 @@ async function fetchHistory(ch, max = 800) {
 
 async function buildKnowledgeBase(client) {
   KB.length = 0;
-  const names = (process.env.KNOWLEDGE_CHANNELS || "").split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
+  const names = (process.env.KNOWLEDGE_CHANNELS || "")
+    .split(",")
+    .map(s => s.trim().toLowerCase())
+    .filter(Boolean);
   if (!names.length) {
     console.log("[KB] No KNOWLEDGE_CHANNELS set — skipping build");
     return;
@@ -135,7 +151,7 @@ async function buildKnowledgeBase(client) {
     for (const [, ch] of guild.channels.cache) {
       if (ch.type !== ChannelType.GuildText) continue;
       if (!names.includes(ch.name.toLowerCase())) continue;
-      if (!canSendInChannel(ch)) continue;
+      if (!canSendInChannel(ch)) continue; // ensures bot can view/read
       try {
         console.log(`[KB] Fetching from #${ch.name}…`);
         const take = Math.min(800, budget);
@@ -148,7 +164,7 @@ async function buildKnowledgeBase(client) {
       }
     }
   }
-  KB.sort((a,b) => b.ts - a.ts);
+  KB.sort((a, b) => b.ts - a.ts);
   console.log(`[KB] Loaded ${KB.length} messages`);
 }
 
@@ -157,17 +173,21 @@ function retrieveSnippets(question, k = 6) {
   const scored = KB
     .map(d => ({ d, s: scoreDoc(qTokens, d) }))
     .filter(x => x.s > 0)
-    .sort((a,b) => b.s - a.s)
+    .sort((a, b) => b.s - a.s)
     .slice(0, k)
     .map(x => x.d);
-  return scored.map(d => `[#${d.channelName}] ${new Date(d.ts).toISOString().split("T")[0]} — ${d.content}`).join("\n\n");
+  return scored
+    .map(d => `[#${d.channelName}] ${ukDate(d.ts)} — ${d.content}`)
+    .join("\n\n");
 }
 
 // ---------- AI reply ----------
 async function aiReply(prompt) {
   try {
     const sys = `You are "CheekyBuddy", a friendly, funny, cheeky (but kind) Discord pal.
-- UK English, short punchy replies, emojis OK.
+- Use UK English.
+- Assume timezone Europe/London (UK). Handle daylight savings (GMT/BST) automatically.
+- Use UK formats for dates/times: DD/MM/YYYY and 24-hour clock (e.g., 17:30).
 - Never say you're an AI. Keep it light, inclusive, and SFW.
 - Avoid @here/@everyone. Keep replies under ~90 words.`;
 
@@ -185,7 +205,7 @@ async function aiReply(prompt) {
     return res.choices?.[0]?.message?.content?.trim() || "";
   } catch (e) {
     console.error("AI error:", e?.status || e?.code || e?.message);
-    return "";
+    return ""; // fall back handled by caller
   }
 }
 
@@ -250,10 +270,12 @@ client.on(Events.MessageCreate, async (message) => {
     const mentioned = message.mentions.has(client.user);
     const chance = isQuestion(content) ? REPLY_CHANCE_QUESTION : REPLY_CHANCE;
 
+    // Always reply if directly mentioned; otherwise probabilistic
     if (!mentioned && Math.random() > chance) return;
 
     await message.channel.sendTyping();
 
+    // Retrieve project snippets if it's a question and we have a KB
     let kbBlock = "";
     if (KB.length && isQuestion(content)) {
       const snips = retrieveSnippets(content, 6);
