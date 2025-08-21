@@ -1,9 +1,10 @@
 import "dotenv/config";
-import { Client, GatewayIntentBits, Partials, ChannelType, Events, PermissionsBitField } from "discord.js";
+import { Client, GatewayIntentBits, Partials, ChannelType, Events, WebhookClient } from "discord.js";
 import OpenAI from "openai";
 
 // ---------- Config ----------
 const REPLY_CHANCE = Number(process.env.REPLY_CHANCE) || 0.30;
+the
 const REPLY_CHANCE_QUESTION = Number(process.env.REPLY_CHANCE_QUESTION) || 0.85;
 const IDLE_MINUTES = Number(process.env.IDLE_MINUTES) || 30;
 const STARTER_COOLDOWN_MINUTES = Number(process.env.STARTER_COOLDOWN_MINUTES) || 45;
@@ -11,10 +12,12 @@ const STARTER_COOLDOWN_MINUTES = Number(process.env.STARTER_COOLDOWN_MINUTES) ||
 // UK language & timezone
 const LANGUAGE = process.env.LANGUAGE || "en-GB";
 const TIMEZONE = process.env.TIMEZONE || "Europe/London";
-// Force Node to use UK time (affects Date -> local time)
-if (!process.env.TZ) process.env.TZ = TIMEZONE;
+if (!process.env.TZ) process.env.TZ = TIMEZONE; // ensure Node uses UK time
 
+// Webhook: manual (server-owned) URL to avoid App badge
+const WEBHOOK_URL = process.env.WEBHOOK_URL || "";
 const WEBHOOK_CHANNEL_NAME = (process.env.WEBHOOK_CHANNEL_NAME || "bot-test").toLowerCase();
+const webhookClient = WEBHOOK_URL ? new WebhookClient({ url: WEBHOOK_URL }) : null;
 
 const ukDate = (ts) =>
   new Intl.DateTimeFormat("en-GB", {
@@ -26,7 +29,6 @@ const ukDate = (ts) =>
     minute: "2-digit",
     hour12: false
   }).format(new Date(ts));
-
 const nowUK = () => ukDate(Date.now());
 
 const allowlist = (process.env.CHANNEL_NAME_ALLOWLIST || "")
@@ -60,15 +62,12 @@ function allowedChannel(ch) {
   if (allowlistSet.size && !allowlistSet.has(ch.name.toLowerCase())) return false;
   return true;
 }
-
 function canSendInChannel(ch) {
   try {
     const me = ch.guild?.members?.me;
     const perms = ch.permissionsFor(me);
     return perms?.has(["ViewChannel","SendMessages","ReadMessageHistory"]);
-  } catch {
-    return false;
-  }
+  } catch { return false; }
 }
 
 const meta = new Map(); // channelId -> { lastMessageTs, lastStarterTs }
@@ -82,11 +81,9 @@ function markStarter(cid) {
   m.lastStarterTs = Date.now();
   meta.set(cid, m);
 }
-
 function isQuestion(text) {
   return /\?$/.test(text) || /\b(why|how|what|where|who|when)\b/i.test(text);
 }
-
 function cheekyStarter(channelName) {
   const picks = [
     `Right, it's gone suspiciously quiet in #${channelName}… what's everyone up to today?`,
@@ -110,7 +107,6 @@ function tokens(s) {
     .split(/\s+/)
     .filter(Boolean);
 }
-
 function scoreDoc(qTokens, doc) {
   const dTokens = tokens(doc.content);
   if (!dTokens.length) return 0;
@@ -119,7 +115,6 @@ function scoreDoc(qTokens, doc) {
   for (const t of qTokens) if (set.has(t)) overlap++;
   return overlap + (/\?/.test(doc.content) ? 0.2 : 0);
 }
-
 async function fetchHistory(ch, max = 800) {
   const out = [];
   let before;
@@ -142,13 +137,10 @@ async function fetchHistory(ch, max = 800) {
   }
   return out;
 }
-
 async function buildKnowledgeBase(client) {
   KB.length = 0;
   const names = (process.env.KNOWLEDGE_CHANNELS || "")
-    .split(",")
-    .map(s => s.trim().toLowerCase())
-    .filter(Boolean);
+    .split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
   if (!names.length) {
     console.log("[KB] No KNOWLEDGE_CHANNELS set — skipping build");
     return;
@@ -174,7 +166,6 @@ async function buildKnowledgeBase(client) {
   KB.sort((a, b) => b.ts - a.ts);
   console.log(`[KB] Loaded ${KB.length} messages`);
 }
-
 function retrieveSnippets(question, k = 6) {
   const qTokens = tokens(question);
   const scored = KB
@@ -203,7 +194,7 @@ async function aiReply(prompt) {
     const res = await aiClient.chat.completions.create({
       model: MODEL,
       temperature: 0.75,
-      max_tokens: 400, // a bit more room to avoid mid-sentence truncation
+      max_tokens: 400,
       messages: [
         { role: "system", content: sys },
         { role: "user", content: prompt || "Say hi in a fun cheeky way." },
@@ -212,54 +203,28 @@ async function aiReply(prompt) {
     });
 
     let out = res.choices?.[0]?.message?.content?.trim() || "";
-    // ensure it finishes the sentence if model forgets punctuation
     if (out && !/[.!?]$/.test(out)) out += ".";
     return out;
   } catch (e) {
     console.error("AI error:", e?.status || e?.code || e?.message);
-    return ""; // fall back handled by caller
+    return "";
   }
 }
 
-// ---------- Webhook utilities ----------
-import { WebhookClient } from "discord.js";
-
-const WEBHOOK_URL = process.env.WEBHOOK_URL || "";
-const webhookClient = WEBHOOK_URL ? new WebhookClient({ url: WEBHOOK_URL }) : null;
-
+// ---------- Webhook sending (manual URL to avoid App badge) ----------
 async function sendViaWebhook(channel, content) {
-  // Prefer manual (non-application) webhook to avoid the "App" badge.
+  // Prefer manual (server-owned) webhook in the configured channel
   if (webhookClient && channel.name.toLowerCase() === WEBHOOK_CHANNEL_NAME) {
     const avatarURL = client.user.displayAvatarURL({ size: 256 });
     console.log(`[WEBHOOK] Sending via MANUAL webhook in #${channel.name}`);
     return webhookClient.send({
       content,
-      username: client.user.username,   // the display name you want
-      avatarURL,                        // keep avatar in sync with bot
+      username: client.user.username,
+      avatarURL,
       allowedMentions: { parse: [] }
     });
   }
-
-  // Fallback: if no manual webhook configured, use/create an app-owned one
-  // (will show the App badge). You can remove this fallback if you want to
-  // guarantee no App badge ever appears.
-  try {
-    const hooks = await channel.fetchWebhooks().catch(() => null);
-    const existing = hooks?.find(h => h.token);
-    if (existing) {
-      console.log(`[WEBHOOK] Sending via APP-OWNED webhook in #${channel.name}`);
-      return existing.send({
-        content,
-        username: client.user.username,
-        avatarURL: client.user.displayAvatarURL({ size: 256 }),
-        allowedMentions: { parse: [] }
-      });
-    }
-  } catch (e) {
-    console.warn("app-owned webhook fallback error:", e?.message || e);
-  }
-
-  // Final fallback: normal send (will show App badge)
+  // Fallback: normal send (will show App badge)
   console.log(`[WEBHOOK] Fallback normal send in #${channel.name}`);
   return channel.send({ content, allowedMentions: { parse: [] } });
 }
@@ -297,7 +262,7 @@ async function idleSweep() {
 }
 
 // ---------- Events ----------
-client.once(Events.ClientReady, async () => {
+client.once(Events.ClientReady, () => {
   console.log(`Logged in as ${client.user.tag}`);
   for (const [, guild] of client.guilds.cache) {
     const list = guild.channels.cache
@@ -305,15 +270,6 @@ client.once(Events.ClientReady, async () => {
       .map(ch => `#${ch.name} (${ch.id})`)
       .join(", ");
     console.log(`[ALLOWED in ${guild.name}]`, list || "(none)");
-    // Pre-create webhook in the target channel so we never fall back
-    const target = guild.channels.cache.find(
-      ch => ch.type === ChannelType.GuildText && ch.name.toLowerCase() === WEBHOOK_CHANNEL_NAME
-    );
-    if (target) {
-      await getOrCreateWebhook(target);
-    } else {
-      console.warn(`[WEBHOOK] Channel #${WEBHOOK_CHANNEL_NAME} not found in ${guild.name}.`);
-    }
   }
   setInterval(idleSweep, 60 * 1000).unref();
   buildKnowledgeBase(client).catch(e => console.error("[KB] build error", e));
@@ -339,7 +295,7 @@ client.on(Events.MessageCreate, async (message) => {
 
     await message.channel.sendTyping();
 
-    // Retrieve project snippets if it's a question and we have a KB
+    // Pull project snippets if it's a question
     let kbBlock = "";
     if (KB.length && isQuestion(content)) {
       const snips = retrieveSnippets(content, 6);
