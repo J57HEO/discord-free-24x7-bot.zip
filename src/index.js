@@ -1,554 +1,983 @@
-// OUKII Discord Bot — src/index.js (drop‑in)
-// Node 18+, discord.js v14
-// Behaviour is driven by PROJECT_BRIEF.md and .env values.
+// src/index.js
+import "dotenv/config";
+import {
+  Client,
+  GatewayIntentBits,
+  Partials,
+  ChannelType,
+  Events,
+  PermissionFlagsBits
+} from "discord.js";
+import OpenAI from "openai";
 
-import 'dotenv/config';
-import { Client, GatewayIntentBits, Partials, Events, ChannelType, Collection, EmbedBuilder } from 'discord.js';
-import axios from 'axios';
+/* =====================
+   ENV / CONFIG
+===================== */
+const REPLY_CHANCE = Number(process.env.REPLY_CHANCE) || 0.30;
+const REPLY_CHANCE_QUESTION = Number(process.env.REPLY_CHANCE_QUESTION) || 0.85;
 
-// ---------- Env & defaults ----------
-const env = (k, d = undefined) => process.env[k] ?? d;
+const IDLE_MINUTES = Number(process.env.IDLE_MINUTES) || 30;
+const STARTER_COOLDOWN_MINUTES = Number(process.env.STARTER_COOLDOWN_MINUTES) || 45;
 
-const CONFIG = {
-  // Discord
-  DISCORD_TOKEN: env('DISCORD_TOKEN'),
+const LANGUAGE = process.env.LANGUAGE || "en-GB";
+const TIMEZONE = process.env.TIMEZONE || "Europe/London";
+if (!process.env.TZ) process.env.TZ = TIMEZONE;
 
-  // OpenRouter / OpenAI-compatible
-  OPENAI_API_KEY: env('OPENAI_API_KEY'),
-  OPENAI_BASE_URL: env('OPENAI_BASE_URL', 'https://openrouter.ai/api/v1'),
-  MODEL: env('MODEL', 'openrouter/auto'),
-  MODEL_FALLBACK: env('MODEL_FALLBACK', 'openrouter/auto'),
+const MODEL = process.env.MODEL || "openrouter/auto";
+const FALLBACK_MODEL = process.env.MODULE_FALLBACK || process.env.MODEL_FALLBACK || "openrouter/auto";
+const THROTTLE_MS = Number(process.env.AI_THROTTLE_MS) || 6000;
 
-  // Behaviour
-  CHANNEL_NAME_ALLOWLIST: new Set((env('CHANNEL_NAME_ALLOWLIST', 'bot-test') || '')
-    .split(',')
-    .map(s => s.trim())
-    .filter(Boolean)),
-  REPLY_CHANCE: Number(env('REPLY_CHANCE', '0.30')),
-  REPLY_CHANCE_QUESTION: Number(env('REPLY_CHANCE_QUESTION', '0.85')),
-  IDLE_MINUTES: Number(env('IDLE_MINUTES', '25')),
-  STARTER_COOLDOWN_MINUTES: Number(env('STARTER_COOLDOWN_MINUTES', '45')),
-  STARTER_USE_AI: /^(true|1)$/i.test(env('STARTER_USE_AI', 'false')),
+// AI budgets (tight for free models) + runtime ceiling that auto-lowers on 402
+const AI_MAX_RESPONSE_TOKENS = Number(process.env.AI_MAX_RESPONSE_TOKENS) || 160;
+const AI_MIN_RESPONSE_TOKENS = Number(process.env.AI_MIN_RESPONSE_TOKENS) || 64;
+let   RUNTIME_MAX_TOKENS     = AI_MAX_RESPONSE_TOKENS;
+const AI_MAX_INPUT_TOKENS    = Number(process.env.AI_MAX_INPUT_TOKENS) || 900;
 
-  // Locale / time
-  TZ: env('TZ', 'Europe/London'),
-  TIMEZONE: env('TIMEZONE', 'Europe/London'),
-  LANGUAGE: env('LANGUAGE', 'en-GB'),
+// GIFs
+const TENOR_API_KEY = process.env.TENOR_API_KEY || "";
 
-  // Knowledge base
-  KNOWLEDGE_CHANNEL_IDS: (env('KNOWLEDGE_CHANNEL_IDS', '') || '')
-    .split(',').map(s => s.trim()).filter(Boolean),
-  KNOWLEDGE_CHANNELS: (env('KNOWLEDGE_CHANNELS', '') || '')
-    .split(',').map(s => s.trim()).filter(Boolean),
-  KNOWLEDGE_MAX_MESSAGES: Number(env('KNOWLEDGE_MAX_MESSAGES', '1500')),
+// Knowledge base — tiny
+const KB_MAX_SNIPPETS   = Number(process.env.KB_MAX_SNIPPETS) || 2;
+const KB_MIN_SCORE      = Number(process.env.KB_MIN_SCORE) || 2;
+const KB_RECENCY_BOOST_DAYS = Number(process.env.KB_RECENCY_BOOST_DAYS) || 45;
+const KB_SNIPPET_CHARS  = Number(process.env.KB_SNIPPET_CHARS) || 150;
+const KB_TOTAL_CHARS    = Number(process.env.KB_TOTAL_CHARS) || 400;
 
-  // Prompt budgets (rough cut, we do character based truncation)
-  AI_MAX_INPUT_TOKENS: Number(env('AI_MAX_INPUT_TOKENS', '900')),
-  AI_MAX_RESPONSE_TOKENS: Number(env('AI_MAX_RESPONSE_TOKENS', '160')),
-  AI_MIN_RESPONSE_TOKENS: Number(env('AI_MIN_RESPONSE_TOKENS', '60')),
-  AI_RETRY_ON_402: /^(true|1)$/i.test(env('AI_RETRY_ON_402', 'true')),
-  KB_MAX_SNIPPETS: Number(env('KB_MAX_SNIPPETS', '2')),
-  KB_SNIPPET_CHARS: Number(env('KB_SNIPPET_CHARS', '150')),
-  KB_TOTAL_CHARS: Number(env('KB_TOTAL_CHARS', '400')),
-  AI_THROTTLE_MS: Number(env('AI_THROTTLE_MS', '6000')),
+const STARTER_USE_AI = String(process.env.STARTER_USE_AI || "false").toLowerCase() === "true";
 
-  // Media
-  TENOR_API_KEY: env('TENOR_API_KEY', ''),
+/* Stickers */
+const STICKER_IDLE_CHANCE = Number(process.env.STICKER_IDLE_CHANCE ?? 0.05); // 5% chance on idle nudge
+const STICKER_DAILY_LIMIT = Number(process.env.STICKER_DAILY_LIMIT ?? 3);    // up to 3/day
+const STICKER_DAY_START_HOUR = Number(process.env.STICKER_DAY_START_HOUR ?? 9);
+const STICKER_DAY_END_HOUR   = Number(process.env.STICKER_DAY_END_HOUR ?? 21);
 
-  // Stickers
-  STICKER_DAILY_LIMIT: Number(env('STICKER_DAILY_LIMIT', '3')),
-  STICKER_IDLE_CHANCE: Number(env('STICKER_IDLE_CHANCE', '0.05')),
-  STICKER_DAY_START_HOUR: Number(env('STICKER_DAY_START_HOUR', '9')),
-  STICKER_DAY_END_HOUR: Number(env('STICKER_DAY_END_HOUR', '21')),
+/* Magic Eden */
+const MAGIC_EDEN_COLLECTION_SYMBOL = process.env.MAGIC_EDEN_COLLECTION_SYMBOL || ""; // e.g. "oukii"
+const MAGICEDEN_API_KEY = process.env.MAGICEDEN_API_KEY || ""; // optional
 
-  // Magic Eden
-  MAGIC_EDEN_COLLECTION_SYMBOL: env('MAGIC_EDEN_COLLECTION_SYMBOL', 'oukii'),
-  MAGICEDEN_API_KEY: env('MAGICEDEN_API_KEY', ''),
-};
+/* Channel allowlist */
+const allowlist = (process.env.CHANNEL_NAME_ALLOWLIST || "")
+  .split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
+const allowlistSet = new Set(allowlist);
 
-// ---------- Client ----------
+/* KB channel IDs (optional) */
+const KB_ID_LIST = (process.env.KNOWLEDGE_CHANNEL_IDS || "")
+  .split(",").map(s => s.trim()).filter(Boolean);
+
+/* =====================
+   UTILITIES
+===================== */
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+const ukDate = (ts) =>
+  new Intl.DateTimeFormat("en-GB", {
+    timeZone: TIMEZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false
+  }).format(new Date(ts));
+const nowUK = () => ukDate(Date.now());
+
+function allowedChannel(ch) {
+  if (!ch) return false;
+  if (ch.type !== ChannelType.GuildText) return false;
+  if (ch.nsfw) return false;
+  if (allowlistSet.size && !allowlistSet.has(ch.name.toLowerCase())) return false;
+  return true;
+}
+function canSendInChannel(ch) {
+  try {
+    const me = ch.guild?.members?.me;
+    const perms = ch.permissionsFor(me);
+    return perms?.has([
+      PermissionFlagsBits.ViewChannel,
+      PermissionFlagsBits.SendMessages,
+      PermissionFlagsBits.ReadMessageHistory
+    ]);
+  } catch { return false; }
+}
+function canReadChannel(ch) {
+  try {
+    const me = ch.guild?.members?.me;
+    const perms = ch.permissionsFor(me);
+    return perms?.has([
+      PermissionFlagsBits.ViewChannel,
+      PermissionFlagsBits.ReadMessageHistory
+    ]);
+  } catch { return false; }
+}
+function isQuestion(text) {
+  return /\?$/.test(text) || /\b(why|how|what|where|who|when|which|can|do|does|did|is|are|will|should)\b/i.test(text);
+}
+function looksLikeGifRequest(text) {
+  return (
+    /^gif[:\s]/i.test(text) ||
+    /\bsend (me )?a gif of\b/i.test(text) ||
+    /\bshow (me )?a gif\b/i.test(text) ||
+    /\bpost (a )?gif\b/i.test(text)
+  );
+}
+function extractGifQuery(text) {
+  const t = text.trim();
+  const m1 = t.match(/^gif[:\s]+(.+)/i);
+  if (m1) return m1[1].trim();
+  const m2 = t.match(/\bsend (me )?a gif of\s+(.+)/i);
+  if (m2) return m2[2].trim();
+  const m3 = t.match(/\bshow (me )?a gif of\s+(.+)/i);
+  if (m3) return m3[2].trim();
+  const m4 = t.match(/\b(post|share)\s+(a\s+)?gif\s+(of|about)?\s*(.+)/i);
+  if (m4) return (m4[4] || "").trim();
+  return t.replace(/^gif[:\s]*/i, "").trim();
+}
+const approxTokens = (s) => Math.ceil((s || "").length / 4);
+
+/* =====================
+   STARTERS (sassier, positive)
+===================== */
+function cheekyStarter(channelName) {
+  const base = [
+    `Alright #${channelName}, brag time: what tiny win are you claiming today? I’ll clap loudest. 👏`,
+    `Tea break audit: what’s in your mug and why is it your personality? ☕️😄`,
+    `Pitch me one bold idea for the project — sensible or spicy, your call. 🌶️`,
+    `Two truths and a lie about your day — I’ll guess terribly. 🕵️`,
+    `What’s your current grind tune? I’m building a playlist of questionable bangers. 🎧`,
+    `If we shipped one delightfully unnecessary feature this week, what would it be? ✨`,
+    `Confess a harmless hot take (PG, mind you). I’ll judge gently. 😏`,
+    `Drop a meme that sums up your week — bonus points for originality. 🧠`,
+    `Tea dunkers vs anti-dunkers: state your case in 10 words or less. ⚖️`,
+    `What’s one question you’re low-key hoping someone asks today? Ask it yourself. 🔁`
+  ];
+  const month = Number(new Intl.DateTimeFormat("en-GB", { timeZone: TIMEZONE, month: "numeric" }).format(new Date()));
+  let seasonal = [];
+  if ([12,1,2].includes(month)) seasonal = [
+    `Winter mode: cosy snack + comfort watch? I’m taking notes. ❄️📺`,
+    `One skill you’ll level up before spring — go on record. 🌱`
+  ];
+  else if ([3,4,5].includes(month)) seasonal = [
+    `Spring clean your habits: what tiny swap is paying off? 🌼`,
+    `Fresh start Friday (even if not Friday): what’s yours? 🧽`
+  ];
+  else if ([6,7,8].includes(month)) seasonal = [
+    `Summer question: iced brew or classic cuppa — and defend it. 🧊☕`,
+    `If holiday mode had a status bar, what % are you at? 🏖️`
+  ];
+  else seasonal = [
+    `Autumn vibe check: what’s your cosy ritual? 🍂`,
+    `Before month-end: one thing you want Future You to high-five. ✅`
+  ];
+  const all = [...base, ...seasonal];
+  const weekIndex = Math.floor(Date.now() / (7 * 24 * 60 * 60 * 1000));
+  return all[weekIndex % all.length];
+}
+
+/* =====================
+   KNOWLEDGE BASE (light)
+===================== */
+const KB = []; // {channelId, channelName, id, author, content, ts}
+
+function tokens(s) {
+  return (s || "")
+    .toLowerCase()
+    .replace(/[`*_~>#[\]()|\\]/g, " ")
+    .replace(/https?:\/\/\S+/g, " ")
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .split(/\s+/)
+    .filter(Boolean);
+}
+function scoreDoc(qTokens, doc) {
+  const dTokens = tokens(doc.content);
+  if (!dTokens.length) return 0;
+  let overlap = 0;
+  const set = new Set(dTokens);
+  for (const t of qTokens) if (set.has(t)) overlap++;
+  const days = (Date.now() - doc.ts) / (24*60*60*1000);
+  const recencyBoost = days <= KB_RECENCY_BOOST_DAYS ? 0.5 : 0;
+  return overlap + recencyBoost;
+}
+async function fetchHistory(ch, max = 800) {
+  const out = [];
+  let before;
+  while (out.length < max) {
+    const batch = await ch.messages.fetch({ limit: 100, ...(before ? { before } : {}) });
+    if (!batch.size) break;
+    for (const [, m] of batch) {
+      const clean = (m.content || "").trim();
+      if (!clean) continue;
+      out.push({
+        channelId: ch.id,
+        channelName: ch.name,
+        id: m.id,
+        author: m.author?.bot ? "bot" : (m.author?.username || "user"),
+        content: clean.slice(0, 1200),
+        ts: m.createdTimestamp
+      });
+    }
+    before = batch.last()?.id;
+    if (!before) break;
+  }
+  return out;
+}
+async function buildKnowledgeBase(client) {
+  KB.length = 0;
+
+  const nameTargets = (process.env.KNOWLEDGE_CHANNELS || "")
+    .split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
+  const idTargets = new Set(KB_ID_LIST);
+
+  console.log("[KB] Target names:", nameTargets.length ? nameTargets.join(", ") : "(none)");
+  console.log("[KB] Target IDs  :", idTargets.size ? [...idTargets].join(", ") : "(none)");
+
+  if (!nameTargets.length && !idTargets.size) {
+    console.log("[KB] No knowledge channels configured — skipping.");
+    return;
+  }
+
+  for (const [, guild] of client.guilds.cache) {
+    console.log(`[KB] Scanning guild: ${guild.name}`);
+    let channels;
+    try {
+      channels = await guild.channels.fetch();
+    } catch (e) {
+      console.warn("[KB] Could not fetch channels for guild:", guild.name, e?.message || e);
+      continue;
+    }
+
+    for (const [, ch] of channels) {
+      if (!ch || ch.type !== ChannelType.GuildText) continue;
+
+      const cname = (ch.name || "").toLowerCase();
+      const isNameTarget = nameTargets.includes(cname);
+      const isIdTarget = idTargets.has(ch.id);
+      if (!isNameTarget && !isIdTarget) continue;
+
+      const readable = canReadChannel(ch);
+      console.log(`[KB] Candidate #${ch.name} (${ch.id}) — nameMatch=${isNameTarget} idMatch=${isIdTarget} readable=${readable}`);
+
+      if (!readable) {
+        console.warn(`[KB] Missing perms for #${ch.name}: need View Channel + Read Message History`);
+        continue;
+      }
+
+      try {
+        const perChannelMax = Math.min(400, Number(process.env.KNOWLEDGE_MAX_MESSAGES) || 800);
+        const msgs = await fetchHistory(ch, perChannelMax);
+        console.log(`[KB] #${ch.name}: fetched ${msgs.length}`);
+        KB.push(...msgs);
+      } catch (e) {
+        console.warn("[KB] fetchHistory failed on", ch.name, e?.message || e);
+      }
+    }
+  }
+
+  KB.sort((a, b) => b.ts - a.ts);
+  console.log(`[KB] Loaded ${KB.length} messages`);
+}
+function retrieveSnippets(question, k = KB_MAX_SNIPPETS) {
+  const qTokens = tokens(question);
+  if (!KB.length || !qTokens.length) return "";
+  const scored = KB
+    .map(d => ({ d, s: scoreDoc(qTokens, d) }))
+    .filter(x => x.s >= KB_MIN_SCORE)
+    .sort((a, b) => b.s - a.s)
+    .slice(0, k)
+    .map(x => x.d);
+
+  if (!scored.length) return "";
+
+  const lines = [];
+  let total = 0;
+  for (const d of scored) {
+    const header = `[#${d.channelName}] ${ukDate(d.ts)} — `;
+    const room = Math.max(0, KB_SNIPPET_CHARS - header.length);
+    const body = (d.content || "").replace(/\s+/g, " ").slice(0, room);
+    const line = header + body;
+    if (total + line.length > KB_TOTAL_CHARS) break;
+    lines.push(line);
+    total += line.length;
+  }
+  return lines.join("\n\n");
+}
+
+/* =====================
+   OPENAI CLIENT + THROTTLE + BUDGET
+===================== */
+const aiClient = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY || process.env.OPENROUTER_API_KEY || "",
+  baseURL: process.env.OPENAI_BASE_URL || "https://openrouter.ai/api/v1"
+});
+let lastCallAt = 0;
+async function throttle() {
+  const now = Date.now();
+  const delta = now - lastCallAt;
+  if (delta < THROTTLE_MS) await sleep(THROTTLE_MS - delta);
+  lastCallAt = Date.now();
+}
+const approxTokenCount = (messages) =>
+  messages.reduce((sum, m) => sum + Math.ceil((m.content || "").length / 4), 0);
+
+function budgetMessages(messages, maxInputTokens) {
+  const clone = messages.map(m => ({ ...m }));
+  const count = () => approxTokenCount(clone);
+
+  while (count() > maxInputTokens) {
+    if (clone[1]?.content?.length > 500) {
+      clone[1].content = clone[1].content.slice(0, clone[1].content.length - 200);
+    } else if (clone[2]?.content?.length > 200) {
+      clone[2].content = clone[2].content.slice(0, clone[2].content.length - 100);
+    } else if (clone[0]?.content?.length > 200) {
+      clone[0].content = clone[0].content.slice(0, clone[0].content.length - 80);
+    } else break;
+  }
+  if (count() > maxInputTokens && clone[1]) {
+    clone[1].content = clone[1].content.replace(/PROJECT NOTES:[\s\S]*$/i, "PROJECT NOTES: (trimmed)");
+  }
+  return clone;
+}
+
+async function modelCall(model, messages) {
+  await throttle();
+  const budgeted = budgetMessages(messages, AI_MAX_INPUT_TOKENS);
+
+  // Clamp to runtime ceiling (auto-lowered after 402)
+  const maxTokens = Math.max(AI_MIN_RESPONSE_TOKENS, Math.min(RUNTIME_MAX_TOKENS, AI_MAX_RESPONSE_TOKENS));
+
+  return aiClient.chat.completions.create({
+    model,
+    temperature: 0.55,
+    max_tokens: maxTokens,
+    messages: budgeted
+  });
+}
+
+// Extract "can only afford N" from OpenRouter 402 message
+function parseAffordableTokens(errMsg) {
+  if (!errMsg) return null;
+  const m = errMsg.match(/can only afford\s+(\d+)/i);
+  if (!m) return null;
+  const n = Number(m[1]);
+  return Number.isFinite(n) ? n : null;
+}
+
+async function aiReply(prompt, kbText) {
+  const sys1 = `You are "CheekyBuddy", a funny, cheeky (but kind) Discord pal.
+Use UK English. Timezone: Europe/London (GMT/BST). Current UK date/time: ${nowUK()} (DD/MM/YYYY HH:mm).
+Keep replies under ~70 words. No @here/@everyone. Finish with a complete sentence.`;
+
+  const grounded = !!kbText;
+  const userMsg = grounded
+    ? `Answer ONLY using the PROJECT NOTES below. If missing, say you don't have that info and suggest #official-links.
+Be helpful, direct, and add ONE playful line max.
+
+User message:
+${prompt}
+
+PROJECT NOTES:
+${kbText}`
+    : prompt;
+
+  const sys2 = `Language: ${LANGUAGE}. If grounded, do not invent info.`;
+
+  const messages = [
+    { role: "system", content: sys1 },
+    { role: "user", content: userMsg },
+    { role: "system", content: sys2 }
+  ];
+
+  // Primary model tries; on 402 lower runtime ceiling using the "afford" number
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const res = await modelCall(MODEL, messages);
+      let out = res?.choices?.[0]?.message?.content?.trim() || "";
+      if (out && !/[.!?]$/.test(out)) out += ".";
+      if (out) return out;
+    } catch (e) {
+      const code = e?.status || e?.code || "";
+      const msg  = e?.message || e?.error?.message || "";
+      if (code === 402) {
+        const afford = parseAffordableTokens(msg);
+        if (afford && afford > 0) {
+          const newCap = Math.max(AI_MIN_RESPONSE_TOKENS, afford - 5);
+          if (newCap < RUNTIME_MAX_TOKENS) {
+            console.warn(`[AI] 402: lowering RUNTIME_MAX_TOKENS ${RUNTIME_MAX_TOKENS} -> ${newCap}`);
+            RUNTIME_MAX_TOKENS = newCap;
+          }
+        } else if (RUNTIME_MAX_TOKENS > 96) {
+          console.warn(`[AI] 402 (no parse): lowering RUNTIME_MAX_TOKENS to 96`);
+          RUNTIME_MAX_TOKENS = 96;
+        }
+        await sleep(800 * (attempt + 1));
+        continue;
+      }
+      if (code === 429 || code === "insufficient_quota") {
+        await sleep(1200 * (attempt + 1));
+        continue;
+      }
+      console.warn("[AI] Primary failed:", code, msg);
+      break;
+    }
+  }
+
+  // Fallback once with same 402 handling
+  try {
+    const res2 = await modelCall(FALLBACK_MODEL, messages);
+    let out2 = res2?.choices?.[0]?.message?.content?.trim() || "";
+    if (out2 && !/[.!?]$/.test(out2)) out2 += ".";
+    if (out2) return out2;
+  } catch (e2) {
+    const code = e2?.status || e2?.code || "";
+    const msg  = e2?.message || e2?.error?.message || "";
+    if (code === 402) {
+      const afford = parseAffordableTokens(msg);
+      if (afford && afford > 0) {
+        const newCap = Math.max(AI_MIN_RESPONSE_TOKENS, afford - 5);
+        if (newCap < RUNTIME_MAX_TOKENS) {
+          console.warn(`[AI] 402 (fallback): lowering RUNTIME_MAX_TOKENS ${RUNTIME_MAX_TOKENS} -> ${newCap}`);
+          RUNTIME_MAX_TOKENS = newCap;
+        }
+      } else if (RUNTIME_MAX_TOKENS > 96) {
+        console.warn(`[AI] 402 (fallback, no parse): lowering RUNTIME_MAX_TOKENS to 96`);
+        RUNTIME_MAX_TOKENS = 96;
+      }
+    } else {
+      console.warn("[AI] Fallback failed:", code, msg);
+    }
+  }
+
+  return "";
+}
+
+/* =====================
+   GIFs (Tenor)
+===================== */
+async function fetchGif(query) {
+  try {
+    if (!TENOR_API_KEY) return null;
+    const url = new URL("https://tenor.googleapis.com/v2/search");
+    url.searchParams.set("q", query);
+    url.searchParams.set("key", TENOR_API_KEY);
+    url.searchParams.set("limit", "1");
+    url.searchParams.set("media_filter", "minimal");
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    const data = await res.json();
+    const gif = data?.results?.[0];
+    const media = gif?.media_formats || gif?.media || {};
+    const mp4 = media?.tinygif?.url || media?.gif?.url || media?.mediumgif?.url;
+    return mp4 || null;
+  } catch (e) {
+    console.warn("[GIF] error:", e?.message || e);
+    return null;
+  }
+}
+
+/* =====================
+   STICKERS (server-owned)
+===================== */
+const guildStickers = new Map(); // guildId -> sticker[]
+async function loadGuildStickers(guild) {
+  try {
+    const coll = await guild.stickers.fetch();
+    const list = [...coll.values()].filter(s => s.available !== false);
+    guildStickers.set(guild.id, list);
+    console.log(`[STICKERS] ${guild.name}: loaded ${list.length} sticker(s)`);
+  } catch (e) {
+    console.warn(`[STICKERS] Failed to fetch for ${guild.name}:`, e?.message || e);
+    guildStickers.set(guild.id, []);
+  }
+}
+function pickRandomSticker(guildId) {
+  const list = guildStickers.get(guildId) || [];
+  if (!list.length) return null;
+  return list[Math.floor(Math.random() * list.length)];
+}
+
+/* =====================
+   IDLE + SCHEDULED STICKERS
+===================== */
+const meta = new Map(); // channelId -> { lastMessageTs, lastStarterTs }
+const lastReplies = new Map(); // channelId -> last bot message
+
+function markMessage(cid) {
+  const m = meta.get(cid) || {};
+  m.lastMessageTs = Date.now();
+  meta.set(cid, m);
+}
+function markStarter(cid) {
+  const m = meta.get(cid) || {};
+  m.lastStarterTs = Date.now();
+  meta.set(cid, m);
+}
+
+async function idleSweep() {
+  const now = Date.now();
+  const idleMs = IDLE_MINUTES * 60 * 1000;
+  const cooldownMs = STARTER_COOLDOWN_MINUTES * 60 * 1000;
+
+  for (const [, guild] of client.guilds.cache) {
+    const channels = guild.channels.cache.filter(allowedChannel);
+    for (const [, ch] of channels) {
+      if (!canSendInChannel(ch)) continue;
+      const m = meta.get(ch.id) || {};
+      const lastMsg = m.lastMessageTs || 0;
+      const lastStarter = m.lastStarterTs || 0;
+      const idle = (now - lastMsg) > idleMs;
+      const cooled = (now - lastStarter) > cooldownMs;
+
+      if (idle && cooled) {
+        try {
+          if (Math.random() < STICKER_IDLE_CHANCE) {
+            const sticker = pickRandomSticker(guild.id);
+            if (sticker) {
+              await ch.send({ stickers: [sticker] });
+              markStarter(ch.id);
+              continue;
+            }
+          }
+          await ch.sendTyping();
+          const prompt = `Create ONE short, upbeat opener for #${ch.name} (max 45 words).
+Be sassy-but-kind, witty, inclusive. Avoid saying "quiet/dead/crickets".
+End with a question that invites easy replies.`;
+          let text = cheekyStarter(ch.name);
+          if (STARTER_USE_AI) {
+            const ai = await aiReply(prompt, null);
+            text = (ai || text).trim();
+          } else {
+            text = text.trim();
+          }
+          if (lastReplies.get(ch.id) === text) return;
+          await ch.send({ content: text, allowedMentions: { parse: [] } });
+          lastReplies.set(ch.id, text);
+          markStarter(ch.id);
+        } catch (e) {
+          console.warn("starter failed for channel", ch.id, e?.message || e);
+        }
+      }
+    }
+  }
+}
+
+/* Scheduled stickers: up to N/day at random UK times */
+const stickerDailyCount = new Map(); // guildId -> { dateKey, count }
+const nextStickerAtByGuild = new Map(); // guildId -> ts
+
+function ukNowDateObj() {
+  const now = new Date();
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: TIMEZONE,
+    year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit",
+    hour12: false
+  }).format(now).replace(",", "");
+  return new Date(parts.replace(" ", "T") + "Z");
+}
+function ukDayKey(d = new Date()) {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: TIMEZONE,
+    year: "numeric", month: "2-digit", day: "2-digit"
+  }).format(d);
+}
+function nextRandomUKTimeTodayOrTomorrow() {
+  const now = ukNowDateObj();
+  const start = new Date(now);
+  start.setHours(STICKER_DAY_START_HOUR, 0, 0, 0);
+  const end = new Date(now);
+  end.setHours(STICKER_DAY_END_HOUR, 0, 0, 0);
+
+  let base;
+  if (now < start) base = start;
+  else if (now > end) { base = new Date(start); base.setDate(base.getDate() + 1); }
+  else base = now;
+
+  const effectiveEnd = (base.getDate() === end.getDate()) ? end : new Date(end.getTime() + 24*60*60*1000);
+  const span = effectiveEnd.getTime() - base.getTime();
+  const target = new Date(base.getTime() + Math.random() * Math.max(span, 1));
+  return target.getTime();
+}
+function scheduleNextStickerForGuild(guildId) {
+  const t = nextRandomUKTimeTodayOrTomorrow();
+  nextStickerAtByGuild.set(guildId, t);
+  console.log(`[STICKERS] Next scheduled sticker for guild ${guildId} at ~ ${ukDate(t)}`);
+}
+function canPostStickerForGuild(guildId) {
+  const key = ukDayKey();
+  const rec = stickerDailyCount.get(guildId) || { dateKey: key, count: 0 };
+  if (rec.dateKey !== key) { rec.dateKey = key; rec.count = 0; }
+  if (rec.count >= STICKER_DAILY_LIMIT) return false;
+  return true;
+}
+function markStickerPosted(guildId) {
+  const key = ukDayKey();
+  const rec = stickerDailyCount.get(guildId) || { dateKey: key, count: 0 };
+  if (rec.dateKey !== key) { rec.dateKey = key; rec.count = 0; }
+  rec.count += 1;
+  stickerDailyCount.set(guildId, rec);
+  console.log(`[STICKERS] Daily count for ${guildId}: ${rec.count}/${STICKER_DAILY_LIMIT} (${rec.dateKey})`);
+}
+async function scheduledStickerSweep() {
+  const now = Date.now();
+  for (const [, guild] of client.guilds.cache) {
+    if (!canPostStickerForGuild(guild.id)) {
+      if (!nextStickerAtByGuild.has(guild.id)) scheduleNextStickerForGuild(guild.id);
+      continue;
+    }
+    if (!nextStickerAtByGuild.has(guild.id)) {
+      scheduleNextStickerForGuild(guild.id);
+      continue;
+    }
+    const dueAt = nextStickerAtByGuild.get(guild.id);
+    if (now < dueAt) continue;
+
+    try {
+      const sticker = pickRandomSticker(guild.id);
+      if (!sticker) { scheduleNextStickerForGuild(guild.id); continue; }
+
+      const quietMs = 15 * 60 * 1000;
+      const channels = guild.channels.cache.filter(allowedChannel);
+      let posted = false;
+      for (const [, ch] of channels) {
+        if (!canSendInChannel(ch)) continue;
+        const m = meta.get(ch.id) || {};
+        const lastMsg = m.lastMessageTs || 0;
+        if (Date.now() - lastMsg < quietMs) continue;
+        await ch.send({ stickers: [sticker] });
+        posted = true;
+        markStickerPosted(guild.id);
+        break;
+      }
+      scheduleNextStickerForGuild(guild.id);
+      if (!posted) console.log("[STICKERS] No suitably quiet channel found; will try next window.");
+    } catch (e) {
+      console.warn("[STICKERS] scheduled send failed:", e?.message || e);
+      scheduleNextStickerForGuild(guild.id);
+    }
+  }
+}
+
+/* =====================
+   MAGIC EDEN HELPERS (with caching)
+===================== */
+const ME_BASE = "https://api-mainnet.magiceden.dev";
+function meHeaders() {
+  const h = { "accept": "application/json" };
+  if (MAGICEDEN_API_KEY) {
+    h["Authorization"] = `Bearer ${MAGICEDEN_API_KEY}`;
+    h["x-api-key"] = MAGICEDEN_API_KEY;
+  }
+  return h;
+}
+const meCache = new Map(); // key -> { ts, data }
+const ME_TTL_MS = 60 * 1000; // 60s
+
+async function meCached(key, fn) {
+  const hit = meCache.get(key);
+  const now = Date.now();
+  if (hit && now - hit.ts < ME_TTL_MS) return hit.data;
+  const data = await fn();
+  meCache.set(key, { ts: now, data });
+  return data;
+}
+async function meFetchStats(symbol) {
+  if (!symbol) return null;
+  return meCached(`stats:${symbol}`, async () => {
+    try {
+      const res = await fetch(`${ME_BASE}/v2/collections/${encodeURIComponent(symbol)}/stats`, { headers: meHeaders() });
+      if (!res.ok) return null;
+      return await res.json(); // { floorPrice, listedCount, ... }
+    } catch (e) {
+      console.warn("[ME] stats error:", e?.message || e);
+      return null;
+    }
+  });
+}
+async function meFetchAttributes(symbol) {
+  if (!symbol) return [];
+  return meCached(`attrs:${symbol}`, async () => {
+    const tryPaths = [
+      `${ME_BASE}/v2/collections/${encodeURIComponent(symbol)}/attributes`,
+      `${ME_BASE}/v2/collections/${encodeURIComponent(symbol)}/traits`
+    ];
+    for (const url of tryPaths) {
+      try {
+        const res = await fetch(url, { headers: meHeaders() });
+        if (!res.ok) continue;
+        const data = await res.json();
+        if (Array.isArray(data)) return data;
+        if (data?.attributes && Array.isArray(data.attributes)) return data.attributes;
+        if (data?.traits && Array.isArray(data.traits)) return data.traits;
+      } catch (e) {
+        console.warn("[ME] attr error:", e?.message || e);
+      }
+    }
+    return [];
+  });
+}
+async function meFetchSales24h(symbol) {
+  if (!symbol) return null;
+  return meCached(`sales24:${symbol}`, async () => {
+    try {
+      const since = Math.floor((Date.now() - 24*60*60*1000) / 1000);
+      const res = await fetch(`${ME_BASE}/v2/collections/${encodeURIComponent(symbol)}/activities?offset=0&limit=200`, {
+        headers: meHeaders()
+      });
+      if (!res.ok) return null;
+      const data = await res.json();
+      const list = Array.isArray(data) ? data : data?.activities || [];
+      let count = 0;
+      for (const a of list) {
+        const ts = a?.blockTime || a?.createdAt || 0;
+        const type = (a?.type || a?.eventType || "").toLowerCase();
+        if (!ts || ts < since) continue;
+        if (type.includes("buy") || type.includes("sold") || type.includes("sale")) count++;
+      }
+      return count;
+    } catch (e) {
+      console.warn("[ME] sales error:", e?.message || e);
+      return null;
+    }
+  });
+}
+async function meFetchCollection(symbol) {
+  if (!symbol) return null;
+  return meCached(`coll:${symbol}`, async () => {
+    try {
+      const res = await fetch(`${ME_BASE}/v2/collections/${encodeURIComponent(symbol)}`, { headers: meHeaders() });
+    if (!res.ok) return null;
+      return await res.json(); // fields vary per collection
+    } catch (e) {
+      console.warn("[ME] collection error:", e?.message || e);
+      return null;
+    }
+  });
+}
+function lamportsToSOL(v) {
+  if (typeof v !== "number") return v;
+  if (v > 1_000_000) return (v / 1_000_000_000).toFixed(3) + " SOL";
+  return v.toString();
+}
+
+/* =====================
+   MEMBER INSIGHT
+===================== */
+async function describeMember(guild, userId, channelForScan) {
+  try {
+    const member = await guild.members.fetch(userId);
+    const display = member.displayName || member.user.username;
+    const joined = member.joinedTimestamp ? ukDate(member.joinedTimestamp) : "unknown";
+    const created = member.user.createdTimestamp ? ukDate(member.user.createdTimestamp) : "unknown";
+    const roles = member.roles.cache
+      .filter(r => r.name !== "@everyone")
+      .map(r => r.name)
+      .slice(0, 6);
+
+    let recentSnippet = "";
+    try {
+      const msgs = await channelForScan.messages.fetch({ limit: 50 });
+      const lastByUser = [...msgs.values()].find(m => m.author?.id === userId && m.content?.trim());
+      if (lastByUser) recentSnippet = lastByUser.content.trim().slice(0, 120);
+    } catch { /* ignore */ }
+
+    const parts = [];
+    parts.push(`**${display}**`);
+    parts.push(`• Joined server: ${joined}`);
+    parts.push(`• Discord account: ${created}`);
+    if (roles.length) parts.push(`• Roles: ${roles.join(", ")}`);
+    if (recentSnippet) parts.push(`• Last seen saying: “${recentSnippet}”`);
+    parts.push(`Certified decent human (99% chance) — unless proven otherwise by biscuit choice. 😉`);
+    return parts.join("\n");
+  } catch {
+    return `I can't fetch that member — they might be new, hidden from my perms, or not in this server.`;
+  }
+}
+
+/* =====================
+   DISCORD CLIENT
+===================== */
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent, // requires privileged intent in Dev Portal
-    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildEmojisAndStickers,
+    GatewayIntentBits.GuildMembers
   ],
-  partials: [Partials.Channel, Partials.Message],
+  partials: [Partials.Channel, Partials.Message]
 });
 
-// ---------- Small utils ----------
-const sleep = ms => new Promise(r => setTimeout(r, ms));
-const clamp = (n, min, max) => Math.min(max, Math.max(min, n));
-const now = () => new Date();
-const isQuestionLike = (s) => /\?$/.test(s.trim()) || /^(who|what|when|where|why|how|does|do|is|are|can|should|could)\b/i.test(s.trim());
-const withinHours = (d, startHour, endHour) => {
-  const h = d.getHours();
-  return h >= startHour && h < endHour;
-};
-const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
+client.once(Events.ClientReady, async () => {
+  console.log(`Logged in as ${client.user.tag}`);
 
-// Track per-channel last activity and last starter time
-const lastMessageAt = new Map();
-const lastStarterAt = new Map();
-
-// Sticker counters
-let stickerDayKey = new Intl.DateTimeFormat('en-GB', { timeZone: CONFIG.TIMEZONE, year: 'numeric', month: '2-digit', day: '2-digit' }).format(now());
-let stickerCountToday = 0;
-
-function resetStickerDailyIfNeeded() {
-  const key = new Intl.DateTimeFormat('en-GB', { timeZone: CONFIG.TIMEZONE, year: 'numeric', month: '2-digit', day: '2-digit' }).format(now());
-  if (key !== stickerDayKey) {
-    stickerDayKey = key;
-    stickerCountToday = 0;
-  }
-}
-
-function allowedChannel(channel) {
-  try {
-    if (!channel || channel.type !== ChannelType.GuildText) return false;
-    if (CONFIG.CHANNEL_NAME_ALLOWLIST.size === 0) return true;
-    return CONFIG.CHANNEL_NAME_ALLOWLIST.has(channel.name);
-  } catch { return false; }
-}
-
-// ---------- Icebreakers (short, UK tone) ----------
-const FALLBACK_STARTERS = [
-  "What’s everyone working on today?", 
-  "Tea or coffee this afternoon? ☕", 
-  "What’s one small win you had this week?",
-  "Drop a tune you’ve had on repeat lately!",
-  "What’s your go‑to productivity hack, then?",
-];
-
-// ---------- Knowledge retrieval (lightweight) ----------
-async function gatherKnowledgeSnippets(guild, queryText) {
-  try {
-    const channels = [];
-    // Prefer explicit IDs
-    for (const id of CONFIG.KNOWLEDGE_CHANNEL_IDS) {
-      const ch = guild.channels.cache.get(id) || await guild.channels.fetch(id).catch(() => null);
-      if (ch && ch.type === ChannelType.GuildText) channels.push(ch);
-    }
-    // Fallback by names
-    if (!channels.length && CONFIG.KNOWLEDGE_CHANNELS.length) {
-      for (const ch of guild.channels.cache.values()) {
-        if (ch.type === ChannelType.GuildText && CONFIG.KNOWLEDGE_CHANNELS.includes(ch.name)) channels.push(ch);
-      }
-    }
-    if (!channels.length) return [];
-
-    const lower = queryText.toLowerCase();
-    const snippets = [];
-    for (const ch of channels) {
-      // Pull recent messages in batches (rate limited) up to KNOWLEDGE_MAX_MESSAGES
-      let fetched = 0;
-      let beforeId = undefined;
-      while (fetched < CONFIG.KNOWLEDGE_MAX_MESSAGES) {
-        const batch = await ch.messages.fetch({ limit: 100, before: beforeId }).catch(() => null);
-        if (!batch || batch.size === 0) break;
-        for (const msg of batch.values()) {
-          const content = (msg.content || '').replace(/<@[!&]?[0-9]+>/g, '@user'); // de‑identify
-          const text = content.toLowerCase();
-          if (text.includes(lower) || (lower.length > 3 && text.includes(lower.slice(0, 4)))) {
-            snippets.push(content);
-            if (snippets.length >= CONFIG.KB_MAX_SNIPPETS) break;
-          }
-        }
-        if (snippets.length >= CONFIG.KB_MAX_SNIPPETS) break;
-        fetched += batch.size;
-        beforeId = batch.last().id;
-      }
-      if (snippets.length >= CONFIG.KB_MAX_SNIPPETS) break;
-    }
-
-    const trimmed = [];
-    let total = 0;
-    for (const s of snippets) {
-      const t = s.slice(0, CONFIG.KB_SNIPPET_CHARS);
-      if (total + t.length > CONFIG.KB_TOTAL_CHARS) break;
-      total += t.length;
-      trimmed.push(t);
-    }
-    return trimmed;
-  } catch (err) {
-    console.warn('KB gather error', err);
-    return [];
-  }
-}
-
-// ---------- OpenAI / OpenRouter call ----------
-let lastAICallAt = 0;
-
-function extractAffordableTokens(err) {
-  try {
-    const msg = err?.response?.data?.error?.message || err?.response?.data?.message || err?.message || '';
-    // Examples we handle:
-    // "This request requires more credits, or fewer max_tokens. You requested up to 200 tokens, but can only afford 189."
-    let m = msg.match(/can only afford\s+(\d+)/i);
-    if (m) return Number(m[1]);
-    m = msg.match(/afford\s+(\d+)/i);
-    if (m) return Number(m[1]);
-    return null;
-  } catch { return null; }
-}
-
-async function askAI({ system, user }) {
-  const since = Date.now() - lastAICallAt;
-  if (since < CONFIG.AI_THROTTLE_MS) {
-    await sleep(CONFIG.AI_THROTTLE_MS - since);
-  }
-  lastAICallAt = Date.now();
-
-  let maxTokens = CONFIG.AI_MAX_RESPONSE_TOKENS;
-  const baseBody = {
-    model: CONFIG.MODEL,
-    messages: [
-      { role: 'system', content: system },
-      { role: 'user', content: user.slice(0, CONFIG.AI_MAX_INPUT_TOKENS * 4) }, // rough char guard
-    ],
-  };
-
-  const headers = {
-    'Authorization': `Bearer ${CONFIG.OPENAI_API_KEY}`,
-    'Content-Type': 'application/json',
-  };
-  const url = `${CONFIG.OPENAI_BASE_URL}/chat/completions`;
-
-  async function send(model, tokens) {
-    const body = { ...baseBody, model, max_tokens: tokens };
-    const res = await axios.post(url, body, { headers, timeout: 30000 });
-    const text = res.data?.choices?.[0]?.message?.content?.trim();
-    return text || '';
+  for (const [, guild] of client.guilds.cache) {
+    await loadGuildStickers(guild);
+    scheduleNextStickerForGuild(guild.id);
   }
 
-  try {
-    // Primary model
-    try {
-      return await send(CONFIG.MODEL, maxTokens);
-    } catch (err) {
-      const status = err?.response?.status;
-      console.warn('[AI] Primary model failed:', status || err?.message);
-      if (status === 402 && CONFIG.AI_RETRY_ON_402) {
-        const affordable = extractAffordableTokens(err);
-        if (affordable && affordable < maxTokens) {
-          const adjusted = clamp(affordable - 5, CONFIG.AI_MIN_RESPONSE_TOKENS, maxTokens);
-          if (adjusted >= CONFIG.AI_MIN_RESPONSE_TOKENS) {
-            console.warn(`[AI] Retrying primary with max_tokens=${adjusted}`);
-            try { return await send(CONFIG.MODEL, adjusted); } catch (e2) {
-              console.warn('[AI] Primary retry failed:', e2?.response?.status || e2?.message);
-            }
-          }
-        }
-      }
-      // Fallback
-      if (CONFIG.MODEL_FALLBACK && CONFIG.MODEL_FALLBACK !== CONFIG.MODEL) {
-        try {
-          return await send(CONFIG.MODEL_FALLBACK, maxTokens);
-        } catch (err2) {
-          const status2 = err2?.response?.status;
-          console.warn('[AI] Fallback model failed:', status2 || err2?.message);
-          if (status2 === 402 && CONFIG.AI_RETRY_ON_402) {
-            const affordable2 = extractAffordableTokens(err2);
-            if (affordable2 && affordable2 < maxTokens) {
-              const adjusted2 = clamp(affordable2 - 5, CONFIG.AI_MIN_RESPONSE_TOKENS, maxTokens);
-              if (adjusted2 >= CONFIG.AI_MIN_RESPONSE_TOKENS) {
-                console.warn(`[AI] Retrying fallback with max_tokens=${adjusted2}`);
-                try { return await send(CONFIG.MODEL_FALLBACK, adjusted2); } catch (e3) {
-                  console.warn('[AI] Fallback retry failed:', e3?.response?.status || e3?.message);
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-    return '';
-  } catch (err) {
-    console.error('AI call catastrophic failure:', err?.response?.status || err?.message);
-    return '';
-  }
-}
-
-// ---------- Tenor (GIFs & stickers) ----------
-async function tenorSearch(q, { sticker = false } = {}) {
-  if (!CONFIG.TENOR_API_KEY) return null;
-  const params = new URLSearchParams({
-    key: CONFIG.TENOR_API_KEY,
-    client_key: 'oukii_discord_bot',
-    q,
-    limit: '20',
-    locale: CONFIG.LANGUAGE,
-    country: 'GB',
-  });
-  if (sticker) params.set('searchfilter', 'sticker');
-  try {
-    const url = `https://tenor.googleapis.com/v2/search?${params.toString()}`;
-    const { data } = await axios.get(url, { timeout: 12000 });
-    const results = data?.results || [];
-    if (!results.length) return null;
-    const item = pick(results);
-    const media = item.media_formats || {};
-    const gifUrl = media?.gif?.url || media?.tinygif?.url || media?.mp4?.url || null;
-    return gifUrl;
-  } catch (e) {
-    console.warn('Tenor error', e?.response?.status || e?.message);
-    return null;
-  }
-}
-
-// ---------- Magic Eden (OUKII) ----------
-async function fetchMagicEdenStats(symbol = CONFIG.MAGIC_EDEN_COLLECTION_SYMBOL) {
-  try {
-    const headers = {};
-    if (CONFIG.MAGICEDEN_API_KEY) headers['Authorization'] = `Bearer ${CONFIG.MAGICEDEN_API_KEY}`;
-    const url = `https://api-mainnet.magiceden.dev/v2/collections/${encodeURIComponent(symbol)}/stats`;
-    const { data } = await axios.get(url, { headers, timeout: 15000 });
-    return data || null;
-  } catch (e) {
-    console.warn('ME stats error', e?.response?.status || e?.message);
-    return null;
-  }
-}
-
-async function fetchMagicEdenActivities24h(symbol = CONFIG.MAGIC_EDEN_COLLECTION_SYMBOL) {
-  try {
-    const headers = {};
-    if (CONFIG.MAGICEDEN_API_KEY) headers['Authorization'] = `Bearer ${CONFIG.MAGICEDEN_API_KEY}`;
-    const url = `https://api-mainnet.magiceden.dev/v2/collections/${encodeURIComponent(symbol)}/activities`;
-    const { data } = await axios.get(url, { headers, timeout: 15000, params: { limit: 100 } });
-    const since = Date.now() - 24 * 60 * 60 * 1000;
-    const sales = (data || []).filter(a => a?.type === 'buyNow' && (new Date(a?.blockTime * 1000).getTime() >= since));
-    return sales;
-  } catch (e) {
-    console.warn('ME activities error', e?.response?.status || e?.message);
-    return [];
-  }
-}
-
-// ---------- Message routing ----------
-function looksLikeGifRequest(text) {
-  return /^gif\s*:\s*(.+)$/i.exec(text) || /\b(send|post)\s+a?\s*(gif|sticker)\s+of\s+(.+)/i.exec(text);
-}
-
-function looksLikeStickerDrop(text) {
-  return /^sticker\s*:\s*(.+)$/i.exec(text);
-}
-
-function looksLikeMemberInsight(text) {
-  return /(tell me something about\s+<@!?\d+>|about\s+(me|my profile))/i.test(text);
-}
-
-function mentionsOtherUser(message) {
-  return message.mentions?.users?.size > 0 && !message.mentions.users.has(message.author.id);
-}
-
-function inAllowedThread(message) {
-  // Don’t interrupt people: if in a thread with >2 participants recently, skip
-  const thread = message.channel;
-  return !(thread?.isThread?.() && thread?.memberCount > 2);
-}
-
-// ---------- Personality prompt ----------
-const SYSTEM_PROMPT = `You are OUKII — a cheeky, kind, UK‑based Discord companion.
-Keep replies short (max ~90 words), UK English, never @here/@everyone, GMT/BST.
-If you’re not sure, say so briefly. Use knowledge snippets if provided.
-`;
-
-// ---------- Idle starter tick ----------
-async function maybePostIdleStarter(channel) {
-  if (!allowedChannel(channel)) return;
-  const nowDt = now();
-  resetStickerDailyIfNeeded();
-  if (!withinHours(nowDt, CONFIG.STICKER_DAY_START_HOUR, CONFIG.STICKER_DAY_END_HOUR)) {
-    // still allow text starters outside sticker hours
+  for (const [, guild] of client.guilds.cache) {
+    const list = guild.channels.cache
+      .filter(allowedChannel)
+      .map(ch => `#${ch.name} (${ch.id})`)
+      .join(", ");
+    console.log(`[ALLOWED in ${guild.name}]`, list || "(none)");
   }
 
-  const lastMsg = lastMessageAt.get(channel.id) || 0;
-  const lastStarter = lastStarterAt.get(channel.id) || 0;
-  const idleMs = CONFIG.IDLE_MINUTES * 60 * 1000;
-  const cooldownMs = CONFIG.STARTER_COOLDOWN_MINUTES * 60 * 1000;
-  if (Date.now() - lastMsg < idleMs) return;
-  if (Date.now() - lastStarter < cooldownMs) return;
+  setTimeout(() => {
+    buildKnowledgeBase(client).catch(e => console.error("[KB] build error", e));
+  }, 3000);
 
-  lastStarterAt.set(channel.id, Date.now());
-
-  // 5% chance to drop a sticker instead of text starter
-  const dropSticker = Math.random() < CONFIG.STICKER_IDLE_CHANCE;
-  if (dropSticker && stickerCountToday < CONFIG.STICKER_DAILY_LIMIT && withinHours(nowDt, CONFIG.STICKER_DAY_START_HOUR, CONFIG.STICKER_DAY_END_HOUR)) {
-    const url = await tenorSearch('hello', { sticker: true });
-    if (url) {
-      stickerCountToday++;
-      await channel.send(url);
-      return;
-    }
-  }
-
-  let text = pick(FALLBACK_STARTERS);
-  if (CONFIG.STARTER_USE_AI && CONFIG.OPENAI_API_KEY) {
-    const ai = await askAI({
-      system: SYSTEM_PROMPT,
-      user: 'Write one upbeat icebreaker for a Discord server. No hashtags. Keep it under 20 words.'
-    });
-    if (ai) text = ai.replace(/@here|@everyone/g, '').trim().slice(0, 140);
-  }
-  await channel.send(text);
-}
-
-// Run periodic idle check every minute
-setInterval(async () => {
-  try {
-    for (const guild of client.guilds.cache.values()) {
-      for (const channel of guild.channels.cache.values()) {
-        if (allowedChannel(channel)) await maybePostIdleStarter(channel);
-      }
-    }
-  } catch (e) {
-    console.warn('Idle check error', e.message);
-  }
-}, 60 * 1000);
-
-// ---------- Member insight ----------
-async function buildMemberInsight(message) {
-  const content = message.content;
-  const meMatch = /about\s+(me|my profile)/i.test(content);
-  let member = null;
-  if (meMatch) {
-    member = await message.guild.members.fetch(message.author.id);
-  } else {
-    const m = content.match(/<@!?(\d+)>/);
-    if (m) member = await message.guild.members.fetch(m[1]).catch(() => null);
-  }
-  if (!member) return "I couldn’t find that member, sorry.";
-
-  // Join date & account age
-  const joinedAt = member.joinedAt || new Date();
-  const createdAt = member.user.createdAt;
-  const daysOld = Math.floor((Date.now() - createdAt.getTime()) / (1000*60*60*24));
-
-  // Roles (top few, excluding @everyone)
-  const roles = member.roles.cache
-    .filter(r => r.name !== '@everyone')
-    .sort((a,b) => b.position - a.position)
-    .first(3)
-    .map(r => r.name);
-
-  // Last snippet (scan recent channel history)
-  let snippet = '';
-  const recent = await message.channel.messages.fetch({ limit: 50 }).catch(() => null);
-  if (recent) {
-    const last = [...recent.values()].find(m => m.author.id === member.id && m.id !== message.id);
-    snippet = last?.content ? last.content.slice(0, 120) : '';
-  }
-
-  const lines = [
-    `Joined: ${joinedAt.toLocaleString('en-GB', { timeZone: CONFIG.TIMEZONE })}`,
-    `Account age: ${daysOld} days`,
-    roles.length ? `Top roles: ${roles.join(', ')}` : null,
-    snippet ? `Recent: “${snippet}”` : null,
-    `All good? Lovely jubbly. 🐾`
-  ].filter(Boolean);
-
-  return lines.join('\n');
-}
-
-// ---------- On ready & messages ----------
-client.once(Events.ClientReady, c => {
-  console.log(`OUKII online as ${c.user.tag}`);
+  setInterval(idleSweep, 60 * 1000).unref();
+  setInterval(scheduledStickerSweep, 60 * 1000).unref();
 });
 
+client.on(Events.GuildStickersUpdate, (guild) => {
+  loadGuildStickers(guild);
+});
+
+/* =====================
+   MESSAGE HANDLER
+===================== */
 client.on(Events.MessageCreate, async (message) => {
   try {
     if (message.author.bot) return;
-    if (!message.guild) return; // ignore DMs
     if (!allowedChannel(message.channel)) return;
-
-    lastMessageAt.set(message.channel.id, Date.now());
-
-    // Don’t interrupt people / mentions of others
-    if (mentionsOtherUser(message) || !inAllowedThread(message)) return;
-
-    const text = message.content?.trim() || '';
-
-    // GIF or sticker request
-    const gifReq = looksLikeGifRequest(text);
-    const stickerReq = looksLikeStickerDrop(text);
-    if (gifReq) {
-      const query = (gifReq[1] || gifReq[3] || '').trim();
-      const isSticker = /sticker/i.test(gifReq[0]);
-      const url = await tenorSearch(query, { sticker: isSticker });
-      if (url) return void message.channel.send(url);
-      return void message.reply('Couldn’t find a good one, sorry!');
+    if (!canSendInChannel(message.channel)) {
+      console.warn("[SKIP] missing perms in channel:", message.channel?.name);
+      return;
     }
-    if (stickerReq) {
-      const query = (stickerReq[1] || '').trim();
-      resetStickerDailyIfNeeded();
-      if (stickerCountToday >= CONFIG.STICKER_DAILY_LIMIT) return;
-      const url = await tenorSearch(query || 'hello', { sticker: true });
-      if (url) {
-        stickerCountToday++;
-        return void message.channel.send(url);
+
+    // etiquette: don't interrupt direct human replies or other @mentions
+    if (message.reference && !message.mentions.has(client.user)) return;
+    if (message.mentions.users.size > 0 && !message.mentions.has(client.user)) return;
+
+    markMessage(message.channelId);
+    const content = (message.content || "").trim();
+
+    // Member insight (mention OR "about me/myself/my profile")
+    const mention = message.mentions.users.first();
+    if (
+      (mention && /\b(tell me something about|who is|info on|about)\b/i.test(content)) ||
+      /\b(about me|about myself|my profile|tell me about me|who am i)\b/i.test(content)
+    ) {
+      const targetId = mention ? mention.id : message.author.id;
+      const summary = await describeMember(message.guild, targetId, message.channel);
+      await message.channel.send({ content: summary, allowedMentions: { parse: [] } });
+      return;
+    }
+
+    // GIF
+    if (looksLikeGifRequest(content)) {
+      const query = extractGifQuery(content) || "funny";
+      if (!TENOR_API_KEY) {
+        await message.channel.send({
+          content: `I can drop GIFs if you add a TENOR_API_KEY in my environment settings. Try “gif: dancing bears” after that.`
+        });
+        return;
+      }
+      await message.channel.sendTyping();
+      const gifUrl = await fetchGif(query);
+      if (gifUrl) {
+        await message.channel.send({ content: gifUrl, allowedMentions: { parse: [] } });
+      } else {
+        await message.channel.send({ content: `Couldn't fetch a gif for “${query}” — try another phrase?` });
       }
       return;
     }
 
-    // Member insight
-    if (looksLikeMemberInsight(text)) {
-      const info = await buildMemberInsight(message);
-      return void message.reply(info);
-    }
-
-    // Magic Eden (simple triggers)
-    if (/\b(oukii|magic eden|me)\b.*(stats|floor|listed|sales)/i.test(text) || /^!oukii\b/i.test(text)) {
-      const [stats, sales] = await Promise.all([
-        fetchMagicEdenStats(CONFIG.MAGIC_EDEN_COLLECTION_SYMBOL),
-        fetchMagicEdenActivities24h(CONFIG.MAGIC_EDEN_COLLECTION_SYMBOL),
+    // Magic Eden (floor/listed/sales/traits/minted)
+    const wantsME = /magic\s*eden|floor price|floor\b|listed\b|on the floor|how many sold|sales|traits|rarity|minted|supply/i.test(content);
+    if (wantsME && MAGIC_EDEN_COLLECTION_SYMBOL) {
+      await message.channel.sendTyping();
+      const [stats, sales24h, attrs, coll] = await Promise.all([
+        meFetchStats(MAGIC_EDEN_COLLECTION_SYMBOL),
+        meFetchSales24h(MAGIC_EDEN_COLLECTION_SYMBOL),
+        meFetchAttributes(MAGIC_EDEN_COLLECTION_SYMBOL),
+        meFetchCollection(MAGIC_EDEN_COLLECTION_SYMBOL)
       ]);
-      const floor = stats?.floorPrice || stats?.floor_price || stats?.floor || null;
-      const listed = stats?.listedCount ?? stats?.listed ?? null;
-      const supply = stats?.supply ?? stats?.totalSupply ?? null;
-      const sales24 = sales?.length || 0;
 
-      const embed = new EmbedBuilder()
-        .setTitle('OUKII — Magic Eden snapshot')
-        .setDescription('Quick stats for the last 24h')
-        .addFields(
-          { name: 'Floor', value: floor ? String(floor) : '—', inline: true },
-          { name: 'Listed', value: listed != null ? String(listed) : '—', inline: true },
-          { name: '24h sales', value: String(sales24), inline: true },
-          { name: 'Supply (if known)', value: supply != null ? String(supply) : 'Not exposed', inline: true },
-        )
-        .setFooter({ text: 'Data: Magic Eden' })
-        .setTimestamp(new Date());
-      return void message.channel.send({ embeds: [embed] });
+      let floorStr = "unknown";
+      let listedStr = "unknown";
+      if (stats) {
+        floorStr = lamportsToSOL(stats.floorPrice);
+        listedStr = String(stats.listedCount ?? "unknown");
+      }
+
+      let totalSupply = null, itemsMinted = null, itemsRemaining = null, itemsAvailable = null;
+      if (coll && typeof coll === "object") {
+        totalSupply   = coll.totalSupply ?? coll.supply ?? coll.itemsAvailable ?? coll.items_total ?? null;
+        itemsMinted   = coll.itemsMinted ?? coll.minted ?? null;
+        itemsRemaining= coll.itemsRemaining ?? coll.remaining ?? null;
+        itemsAvailable= coll.itemsAvailable ?? null;
+      }
+      let mintedLine = "";
+      if (itemsMinted != null) mintedLine = `• Minted: ${itemsMinted}`;
+      else if (totalSupply != null && itemsRemaining != null) mintedLine = `• Minted: ${Number(totalSupply) - Number(itemsRemaining)} / ${totalSupply}`;
+      else if (totalSupply != null) mintedLine = `• Total supply: ${totalSupply}`;
+      else if (itemsAvailable != null) mintedLine = `• Items available: ${itemsAvailable}`;
+
+      let rareLine = "";
+      if (Array.isArray(attrs) && attrs.length) {
+        const items = attrs.map(a => {
+          if (a.trait_type && a.value && a.count != null) return a;
+          const keys = Object.keys(a || {});
+          return {
+            trait_type: a.trait_type || a.traitType || "Trait",
+            value: a.value || a.name || a.val || (keys[0] || "Value"),
+            count: a.count || a.quantity || a.num || 0
+          };
+        }).filter(x => x.count != null);
+        items.sort((x, y) => (x.count ?? 0) - (y.count ?? 0));
+        const top = items.slice(0, 3);
+        if (top.length) rareLine = top.map(t => `${t.trait_type}: ${t.value} (${t.count} pcs)`).join(" · ");
+      }
+
+      const bits = [];
+      bits.push(`**Magic Eden — ${MAGIC_EDEN_COLLECTION_SYMBOL}**`);
+      if (mintedLine) bits.push(mintedLine);
+      bits.push(`• Floor: ${floorStr}`);
+      bits.push(`• Listed (“on the floor”): ${listedStr}`);
+      if (sales24h != null) bits.push(`• Sold (last 24h): ${sales24h}`);
+      if (rareLine) bits.push(`• Rare traits to watch: ${rareLine}`);
+      if (!mintedLine) bits.push(`(Minted/total supply not exposed by ME for this collection — shout if you track it elsewhere.)`);
+      await message.channel.send({ content: bits.join("\n"), allowedMentions: { parse: [] } });
+      return;
     }
 
-    // Decide whether to reply
-    const chance = isQuestionLike(text) ? CONFIG.REPLY_CHANCE_QUESTION : CONFIG.REPLY_CHANCE;
-    if (Math.random() > chance) return;
+    // Normal chat participation (probabilistic, AI)
+    const chance = isQuestion(content) ? REPLY_CHANCE_QUESTION : REPLY_CHANCE;
+    if (!message.mentions.has(client.user) && Math.random() > chance) return;
 
-    // Gather knowledge
-    const snippets = await gatherKnowledgeSnippets(message.guild, text);
-    const kbBlock = snippets.length ? `\n\nKnowledge:\n- ${snippets.join('\n- ')}` : '';
-
-    // Build prompt
-    const userPrompt = `User said: "${text}"${kbBlock}\n\nReply in under 90 words, friendly and cheeky (but kind). Do not mention @here or @everyone.`;
-
-    let aiReply = '';
-    if (CONFIG.OPENAI_API_KEY) {
-      aiReply = await askAI({ system: SYSTEM_PROMPT, user: userPrompt });
+    // Tiny KB for questions
+    let kbText = "";
+    if (isQuestion(content) && KB.length) {
+      const snips = retrieveSnippets(content, KB_MAX_SNIPPETS);
+      if (snips) kbText = snips;
     }
 
-    const safeReply = (aiReply || 'Got you. 👍').replace(/@here|@everyone/g, '').trim();
-    if (safeReply) await message.reply(safeReply);
+    await message.channel.sendTyping();
+    const prompt = `Channel: #${message.channel.name}
+User said: ${content.slice(0, 600)}`;
+
+    let out = await aiReply(prompt, kbText || null);
+
+    if (!out) {
+      if (kbText) out = `I can't see a clear answer in the notes. Check #official-links or ask a mod for the latest details.`;
+      else if (isQuestion(content)) out = `I don't have that to hand just yet — can you check #official-links or the pinned messages?`;
+      else out = `Noted. Fancy turning that into a question so I can help properly?`;
+    }
+
+    if (lastReplies.get(message.channelId) === out) {
+      out += " (not déjà vu — just emphasis!)";
+    }
+    await message.channel.send({ content: out, allowedMentions: { parse: [] } });
+    lastReplies.set(message.channelId, out);
+
   } catch (e) {
-    console.error('Message handler error:', e);
+    console.error("on message error:", e?.message || e);
   }
 });
 
-// ---------- Login ----------
-if (!CONFIG.DISCORD_TOKEN) {
-  console.error('Missing DISCORD_TOKEN in env.');
-  process.exit(1);
-}
-client.login(CONFIG.DISCORD_TOKEN);
+/* =====================
+   BOOT
+===================== */
+client.login(process.env.DISCORD_TOKEN);
