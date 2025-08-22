@@ -13,21 +13,31 @@ import OpenAI from "openai";
 /* =====================
    ENV / CONFIG
 ===================== */
-const REPLY_CHANCE = Number(process.env.REPLY_CHANCE) || 0.45; // slightly chattier by default
+// Base reply probabilities
+const REPLY_CHANCE = Number(process.env.REPLY_CHANCE) || 0.30;
 const REPLY_CHANCE_QUESTION = Number(process.env.REPLY_CHANCE_QUESTION) || 0.85;
 
+// Idle starters
 const IDLE_MINUTES = Number(process.env.IDLE_MINUTES) || 30;
 const STARTER_COOLDOWN_MINUTES = Number(process.env.STARTER_COOLDOWN_MINUTES) || 45;
+const STARTER_USE_AI = String(process.env.STARTER_USE_AI || "false").toLowerCase() === "true";
+
+// Conversation “join in” tuning (new)
+const CONVO_CHIME_CHANCE_MENTION = Number(process.env.CONVO_CHIME_CHANCE_MENTION || 0.10); // someone mentioned (not bot)
+const CONVO_CHIME_CHANCE_MENTION_QUESTION = Number(process.env.CONVO_CHIME_CHANCE_MENTION_QUESTION || 0.60);
+const CONVO_CHIME_CHANCE_REPLY = Number(process.env.CONVO_CHIME_CHANCE_REPLY || 0.15); // message is a reply (not to bot)
+const CONVO_CHIME_CHANCE_REPLY_QUESTION = Number(process.env.CONVO_CHIME_CHANCE_REPLY_QUESTION || 0.70);
 
 const LANGUAGE = process.env.LANGUAGE || "en-GB";
 const TIMEZONE = process.env.TIMEZONE || "Europe/London";
 if (!process.env.TZ) process.env.TZ = TIMEZONE;
 
+// Models
 const MODEL = process.env.MODEL || "openrouter/auto";
-const FALLBACK_MODEL = process.env.MODEL_FALLBACK || "openrouter/auto";
+const FALLBACK_MODEL = process.env.MODULE_FALLBACK || process.env.MODEL_FALLBACK || "openrouter/auto";
 const THROTTLE_MS = Number(process.env.AI_THROTTLE_MS) || 6000;
 
-// AI budgets (tight for free models) + runtime ceiling that auto-lowers on 402
+// AI budgets (tight for free tiers) + runtime ceiling that auto-lowers on 402
 const AI_MAX_RESPONSE_TOKENS = Number(process.env.AI_MAX_RESPONSE_TOKENS) || 160;
 const AI_MIN_RESPONSE_TOKENS = Number(process.env.AI_MIN_RESPONSE_TOKENS) || 64;
 let   RUNTIME_MAX_TOKENS     = AI_MAX_RESPONSE_TOKENS;
@@ -43,21 +53,27 @@ const KB_RECENCY_BOOST_DAYS = Number(process.env.KB_RECENCY_BOOST_DAYS) || 45;
 const KB_SNIPPET_CHARS  = Number(process.env.KB_SNIPPET_CHARS) || 150;
 const KB_TOTAL_CHARS    = Number(process.env.KB_TOTAL_CHARS) || 400;
 
-const STARTER_USE_AI = String(process.env.STARTER_USE_AI || "false").toLowerCase() === "true";
-
-/* Stickers */
-const STICKER_IDLE_CHANCE = Number(process.env.STICKER_IDLE_CHANCE ?? 0.05); // 5% chance on idle nudge
+// Stickers
+const STICKER_IDLE_CHANCE = Number(process.env.STICKER_IDLE_CHANCE ?? 0.05); // 5% on idle prompt
 const STICKER_DAILY_LIMIT = Number(process.env.STICKER_DAILY_LIMIT ?? 3);    // up to 3/day
 const STICKER_DAY_START_HOUR = Number(process.env.STICKER_DAY_START_HOUR ?? 9);
 const STICKER_DAY_END_HOUR   = Number(process.env.STICKER_DAY_END_HOUR ?? 21);
 
-/* Magic Eden */
-const MAGIC_EDEN_COLLECTION_SYMBOL = process.env.MAGIC_EDEN_COLLECTION_SYMBOL || ""; // e.g. "oukii"
-const MAGICEDEN_API_KEY = process.env.MAGICEDEN_API_KEY || ""; // optional
+// Magic Eden
+const MAGIC_EDEN_COLLECTION_SYMBOL = process.env.MAGIC_EDEN_COLLECTION_SYMBOL || ""; // e.g., "oukii"
+const MAGICEDEN_API_KEY = process.env.MAGICEDEN_API_KEY || ""; // optional key
 
-/* Channel allowlist */
+/* =====================
+   CHANNEL ALLOWLIST
+===================== */
+// Normalise channel names: remove leading '#', trim, lowercase
+function normName(s) {
+  return (s || "").toString().replace(/^#/, "").trim().toLowerCase();
+}
 const allowlist = (process.env.CHANNEL_NAME_ALLOWLIST || "")
-  .split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
+  .split(",")
+  .map(normName)
+  .filter(Boolean);
 const allowlistSet = new Set(allowlist);
 
 /* KB channel IDs (optional) */
@@ -81,43 +97,17 @@ const ukDate = (ts) =>
   }).format(new Date(ts));
 const nowUK = () => ukDate(Date.now());
 
-function isThread(ch) {
-  return ch?.type === ChannelType.PublicThread ||
-         ch?.type === ChannelType.PrivateThread ||
-         ch?.type === ChannelType.AnnouncementThread;
-}
-
-function baseChannel(ch) {
-  return isThread(ch) ? ch.parent : ch;
-}
-
 function allowedChannel(ch) {
   if (!ch) return false;
-  const allowedTypes = new Set([
-    ChannelType.GuildText,
-    ChannelType.PublicThread,
-    ChannelType.PrivateThread,
-    ChannelType.AnnouncementThread
-  ]);
-  if (!allowedTypes.has(ch.type)) return false;
-
-  // Block NSFW if either the thread OR parent is NSFW
-  if (ch.nsfw || ch.parent?.nsfw) return false;
-
-  // If allowlist is present, match on the channel name OR the parent name (for threads)
-  if (allowlistSet.size) {
-    const name = (ch.name || "").toLowerCase();
-    const parentName = (ch.parent?.name || "").toLowerCase();
-    if (!allowlistSet.has(name) && !allowlistSet.has(parentName)) return false;
-  }
+  if (ch.type !== ChannelType.GuildText) return false;
+  if (ch.nsfw) return false;
+  if (allowlistSet.size && !allowlistSet.has(normName(ch.name))) return false;
   return true;
 }
-
 function canSendInChannel(ch) {
   try {
-    const target = baseChannel(ch);
-    const me = target?.guild?.members?.me;
-    const perms = target?.permissionsFor(me);
+    const me = ch.guild?.members?.me;
+    const perms = ch.permissionsFor(me);
     return perms?.has([
       PermissionFlagsBits.ViewChannel,
       PermissionFlagsBits.SendMessages,
@@ -127,9 +117,8 @@ function canSendInChannel(ch) {
 }
 function canReadChannel(ch) {
   try {
-    const target = baseChannel(ch);
-    const me = target?.guild?.members?.me;
-    const perms = target?.permissionsFor(me);
+    const me = ch.guild?.members?.me;
+    const perms = ch.permissionsFor(me);
     return perms?.has([
       PermissionFlagsBits.ViewChannel,
       PermissionFlagsBits.ReadMessageHistory
@@ -144,14 +133,11 @@ function looksLikeGifRequest(text) {
     /^gif[:\s]/i.test(text) ||
     /\bsend (me )?a gif of\b/i.test(text) ||
     /\bshow (me )?a gif\b/i.test(text) ||
-    /\bpost (a )?gif\b/i.test(text) ||
-    /^\/gif\s+/i.test(text)
+    /\bpost (a )?gif\b/i.test(text)
   );
 }
 function extractGifQuery(text) {
   const t = text.trim();
-  const m0 = t.match(/^\/gif\s+(.+)/i);
-  if (m0) return m0[1].trim();
   const m1 = t.match(/^gif[:\s]+(.+)/i);
   if (m1) return m1[1].trim();
   const m2 = t.match(/\bsend (me )?a gif of\s+(.+)/i);
@@ -162,8 +148,7 @@ function extractGifQuery(text) {
   if (m4) return (m4[4] || "").trim();
   return t.replace(/^gif[:\s]*/i, "").trim();
 }
-const approxTokenCount = (messages) =>
-  messages.reduce((sum, m) => sum + Math.ceil((m.content || "").length / 4), 0);
+const approxTokens = (s) => Math.ceil((s || "").length / 4);
 
 /* =====================
    STARTERS (sassier, positive)
@@ -255,7 +240,7 @@ async function buildKnowledgeBase(client) {
   KB.length = 0;
 
   const nameTargets = (process.env.KNOWLEDGE_CHANNELS || "")
-    .split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
+    .split(",").map(s => normName(s)).filter(Boolean);
   const idTargets = new Set(KB_ID_LIST);
 
   console.log("[KB] Target names:", nameTargets.length ? nameTargets.join(", ") : "(none)");
@@ -279,7 +264,7 @@ async function buildKnowledgeBase(client) {
     for (const [, ch] of channels) {
       if (!ch || ch.type !== ChannelType.GuildText) continue;
 
-      const cname = (ch.name || "").toLowerCase();
+      const cname = normName(ch.name);
       const isNameTarget = nameTargets.includes(cname);
       const isIdTarget = idTargets.has(ch.id);
       if (!isNameTarget && !isIdTarget) continue;
@@ -335,12 +320,10 @@ function retrieveSnippets(question, k = KB_MAX_SNIPPETS) {
 /* =====================
    OPENAI CLIENT + THROTTLE + BUDGET
 ===================== */
-const usingOpenRouter = !!process.env.OPENROUTER_API_KEY || /openrouter/i.test(process.env.OPENAI_BASE_URL || "");
 const aiClient = new OpenAI({
-  apiKey: usingOpenRouter ? (process.env.OPENROUTER_API_KEY) : process.env.OPENAI_API_KEY,
-  baseURL: process.env.OPENAI_BASE_URL || (usingOpenRouter ? "https://openrouter.ai/api/v1" : undefined)
+  apiKey: process.env.OPENAI_API_KEY || process.env.OPENROUTER_API_KEY || "",
+  baseURL: process.env.OPENAI_BASE_URL || "https://openrouter.ai/api/v1"
 });
-
 let lastCallAt = 0;
 async function throttle() {
   const now = Date.now();
@@ -348,19 +331,20 @@ async function throttle() {
   if (delta < THROTTLE_MS) await sleep(THROTTLE_MS - delta);
   lastCallAt = Date.now();
 }
+const approxTokenCount = (messages) =>
+  messages.reduce((sum, m) => sum + Math.ceil((m.content || "").length / 4), 0);
 
 function budgetMessages(messages, maxInputTokens) {
   const clone = messages.map(m => ({ ...m }));
   const count = () => approxTokenCount(clone);
-  const trimAtWord = (s, n) => s.length <= n ? s : s.slice(0, n).replace(/\s+\S*$/,'') + '…';
 
   while (count() > maxInputTokens) {
     if (clone[1]?.content?.length > 500) {
-      clone[1].content = trimAtWord(clone[1].content, clone[1].content.length - 200);
+      clone[1].content = clone[1].content.slice(0, clone[1].content.length - 200);
     } else if (clone[2]?.content?.length > 200) {
-      clone[2].content = trimAtWord(clone[2].content, clone[2].content.length - 100);
+      clone[2].content = clone[2].content.slice(0, clone[2].content.length - 100);
     } else if (clone[0]?.content?.length > 200) {
-      clone[0].content = trimAtWord(clone[0].content, clone[0].content.length - 80);
+      clone[0].content = clone[0].content.slice(0, clone[0].content.length - 80);
     } else break;
   }
   if (count() > maxInputTokens && clone[1]) {
@@ -373,6 +357,7 @@ async function modelCall(model, messages) {
   await throttle();
   const budgeted = budgetMessages(messages, AI_MAX_INPUT_TOKENS);
 
+  // Clamp to runtime ceiling (auto-lowered after 402)
   const maxTokens = Math.max(AI_MIN_RESPONSE_TOKENS, Math.min(RUNTIME_MAX_TOKENS, AI_MAX_RESPONSE_TOKENS));
 
   return aiClient.chat.completions.create({
@@ -383,6 +368,7 @@ async function modelCall(model, messages) {
   });
 }
 
+// Extract "can only afford N" from OpenRouter 402 message
 function parseAffordableTokens(errMsg) {
   if (!errMsg) return null;
   const m = errMsg.match(/can only afford\s+(\d+)/i);
@@ -396,10 +382,9 @@ async function aiReply(prompt, kbText) {
 Use UK English. Timezone: Europe/London (GMT/BST). Current UK date/time: ${nowUK()} (DD/MM/YYYY HH:mm).
 Keep replies under ~70 words. No @here/@everyone. Finish with a complete sentence.`;
 
-  // So the bot can still answer if KB isn't relevant
   const grounded = !!kbText;
   const userMsg = grounded
-    ? `Prefer the PROJECT NOTES below. If missing, say you don't have that info and suggest #official-links.
+    ? `Answer ONLY using the PROJECT NOTES below. If missing, say you don't have that info and suggest #official-links.
 Be helpful, direct, and add ONE playful line max.
 
 User message:
@@ -417,6 +402,7 @@ ${kbText}`
     { role: "system", content: sys2 }
   ];
 
+  // Primary model tries; on 402 lower runtime ceiling using the "afford" number
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       const res = await modelCall(MODEL, messages);
@@ -441,7 +427,7 @@ ${kbText}`
         await sleep(800 * (attempt + 1));
         continue;
       }
-      if (code === 429 || code === "insufficient_quota" || code === "overloaded" || code === "model_not_available") {
+      if (code === 429 || code === "insufficient_quota") {
         await sleep(1200 * (attempt + 1));
         continue;
       }
@@ -450,6 +436,7 @@ ${kbText}`
     }
   }
 
+  // Fallback once with same 402 handling
   try {
     const res2 = await modelCall(FALLBACK_MODEL, messages);
     let out2 = res2?.choices?.[0]?.message?.content?.trim() || "";
@@ -526,12 +513,8 @@ function pickRandomSticker(guildId) {
 /* =====================
    IDLE + SCHEDULED STICKERS
 ===================== */
-const meta = new Map(); // channelKey -> { lastMessageTs, lastStarterTs }
-const lastReplies = new Map(); // channelKey -> last bot message
-
-function channelKeyFor(ch) {
-  return isThread(ch) ? ch.parentId : ch.id;
-}
+const meta = new Map(); // channelId -> { lastMessageTs, lastStarterTs }
+const lastReplies = new Map(); // channelId -> last bot message
 
 function markMessage(cid) {
   const m = meta.get(cid) || {};
@@ -553,8 +536,7 @@ async function idleSweep() {
     const channels = guild.channels.cache.filter(allowedChannel);
     for (const [, ch] of channels) {
       if (!canSendInChannel(ch)) continue;
-      const key = channelKeyFor(ch);
-      const m = meta.get(key) || {};
+      const m = meta.get(ch.id) || {};
       const lastMsg = m.lastMessageTs || 0;
       const lastStarter = m.lastStarterTs || 0;
       const idle = (now - lastMsg) > idleMs;
@@ -566,7 +548,7 @@ async function idleSweep() {
             const sticker = pickRandomSticker(guild.id);
             if (sticker) {
               await ch.send({ stickers: [sticker] });
-              markStarter(key);
+              markStarter(ch.id);
               continue;
             }
           }
@@ -581,10 +563,10 @@ End with a question that invites easy replies.`;
           } else {
             text = text.trim();
           }
-          if (lastReplies.get(key) === text) { continue; } // <-- FIX: don't abort whole sweep
+          if (lastReplies.get(ch.id) === text) return;
           await ch.send({ content: text, allowedMentions: { parse: [] } });
-          lastReplies.set(key, text);
-          markStarter(key);
+          lastReplies.set(ch.id, text);
+          markStarter(ch.id);
         } catch (e) {
           console.warn("starter failed for channel", ch.id, e?.message || e);
         }
@@ -673,8 +655,7 @@ async function scheduledStickerSweep() {
       let posted = false;
       for (const [, ch] of channels) {
         if (!canSendInChannel(ch)) continue;
-        const key = channelKeyFor(ch);
-        const m = meta.get(key) || {};
+        const m = meta.get(ch.id) || {};
         const lastMsg = m.lastMessageTs || 0;
         if (Date.now() - lastMsg < quietMs) continue;
         await ch.send({ stickers: [sticker] });
@@ -844,6 +825,10 @@ const client = new Client({
 client.once(Events.ClientReady, async () => {
   console.log(`Logged in as ${client.user.tag}`);
 
+  // Log allowlist for sanity
+  console.log("[ALLOWLIST raw env]:", process.env.CHANNEL_NAME_ALLOWLIST || "(empty)");
+  console.log("[ALLOWLIST parsed ]:", allowlist.length ? allowlist.join(", ") : "(all text channels)");
+
   for (const [, guild] of client.guilds.cache) {
     await loadGuildStickers(guild);
     scheduleNextStickerForGuild(guild.id);
@@ -852,9 +837,9 @@ client.once(Events.ClientReady, async () => {
   for (const [, guild] of client.guilds.cache) {
     const list = guild.channels.cache
       .filter(allowedChannel)
-      .map(ch => `#${isThread(ch) ? `${ch.parent?.name}/${ch.name}` : ch.name} (${ch.id})`)
+      .map(ch => `#${ch.name} (${ch.id})`)
       .join(", ");
-    console.log(`[ALLOWED in ${guild.name}]`, list || "(none)");
+    console.log(`[ALLOWED in ${guild.name}]`, list || "(none) — check CHANNEL_NAME_ALLOWLIST & perms");
   }
 
   setTimeout(() => {
@@ -881,24 +866,30 @@ client.on(Events.MessageCreate, async (message) => {
       return;
     }
 
-    // Relaxed etiquette: the bot can join in even if people mention each other.
-    // We only skip if it's a system-level ping @here/@everyone to avoid noise.
-    const raw = (message.content || "").trim();
-    if (!raw) return;
-    if (/@everyone|@here/.test(raw)) {
-      // still record activity but avoid replying to broadcast pings
-      markMessage(channelKeyFor(message.channel));
-      return;
+    // New etiquette: usually don’t interrupt, but sometimes chime in.
+    const content = (message.content || "").trim();
+    const questiony = isQuestion(content);
+
+    // If the message is a reply but not to the bot, chime in sometimes
+    if (message.reference && !message.mentions.has(client.user)) {
+      const chance = questiony ? CONVO_CHIME_CHANCE_REPLY_QUESTION : CONVO_CHIME_CHANCE_REPLY;
+      if (Math.random() > chance) return; // most times, stay out
     }
 
-    // Track last-activity at the parent level for threads
-    markMessage(channelKeyFor(message.channel));
+    // If the message mentions someone else (not the bot), chime in rarely / more if a question
+    if (message.mentions.users.size > 0 && !message.mentions.has(client.user)) {
+      const chance = questiony ? CONVO_CHIME_CHANCE_MENTION_QUESTION : CONVO_CHIME_CHANCE_MENTION;
+      if (Math.random() > chance) return;
+    }
 
-    // Member insight (mention OR "about me/myself/my profile")
+    // Mark activity
+    markMessage(message.channelId);
+
+    // Member insight
     const mention = message.mentions.users.first();
     if (
-      (mention && /\b(tell me something about|who is|info on|about)\b/i.test(raw)) ||
-      /\b(about me|about myself|my profile|tell me about me|who am i)\b/i.test(raw)
+      (mention && /\b(tell me something about|who is|info on|about)\b/i.test(content)) ||
+      /\b(about me|about myself|my profile|tell me about me|who am i)\b/i.test(content)
     ) {
       const targetId = mention ? mention.id : message.author.id;
       const summary = await describeMember(message.guild, targetId, message.channel);
@@ -907,8 +898,8 @@ client.on(Events.MessageCreate, async (message) => {
     }
 
     // GIF
-    if (looksLikeGifRequest(raw)) {
-      const query = extractGifQuery(raw) || "funny";
+    if (looksLikeGifRequest(content)) {
+      const query = extractGifQuery(content) || "funny";
       if (!TENOR_API_KEY) {
         await message.channel.send({
           content: `I can drop GIFs if you add a TENOR_API_KEY in my environment settings. Try “gif: dancing bears” after that.`
@@ -925,8 +916,8 @@ client.on(Events.MessageCreate, async (message) => {
       return;
     }
 
-    // Magic Eden (floor/listed/sales/traits/minted)
-    const wantsME = /magic\s*eden|floor price|floor\b|listed\b|on the floor|how many sold|sales|traits|rarity|minted|supply/i.test(raw);
+    // Magic Eden
+    const wantsME = /magic\s*eden|floor price|floor\b|listed\b|on the floor|how many sold|sales|traits|rarity|minted|supply/i.test(content);
     if (wantsME && MAGIC_EDEN_COLLECTION_SYMBOL) {
       await message.channel.sendTyping();
       const [stats, sales24h, attrs, coll] = await Promise.all([
@@ -984,38 +975,39 @@ client.on(Events.MessageCreate, async (message) => {
       return;
     }
 
-    // Normal chat participation (probabilistic, AI) — relaxed so it can join even during active chats
-    const baseChance = isQuestion(raw) ? REPLY_CHANCE_QUESTION : REPLY_CHANCE;
-    const mentionBoost = message.mentions.has(client.user) ? 0.25 : 0; // reply more often if pinged
-    const chance = Math.min(1, baseChance + mentionBoost);
-
+    // Normal chat participation (probabilistic, AI)
+    let chance = isQuestion(content) ? REPLY_CHANCE_QUESTION : REPLY_CHANCE;
+    // If it was a reply/mention we decided to consider, slightly boost chance
+    if ((message.reference && !message.mentions.has(client.user)) ||
+        (message.mentions.users.size > 0 && !message.mentions.has(client.user))) {
+      chance = Math.min(1, chance + 0.15);
+    }
     if (!message.mentions.has(client.user) && Math.random() > chance) return;
 
     // Tiny KB for questions
     let kbText = "";
-    if (isQuestion(raw) && KB.length) {
-      const snips = retrieveSnippets(raw, KB_MAX_SNIPPETS);
+    if (isQuestion(content) && KB.length) {
+      const snips = retrieveSnippets(content, KB_MAX_SNIPPETS);
       if (snips) kbText = snips;
     }
 
     await message.channel.sendTyping();
     const prompt = `Channel: #${message.channel.name}
-User said: ${raw.slice(0, 600)}`;
+User said: ${content.slice(0, 600)}`;
 
     let out = await aiReply(prompt, kbText || null);
 
     if (!out) {
       if (kbText) out = `I can't see a clear answer in the notes. Check #official-links or ask a mod for the latest details.`;
-      else if (isQuestion(raw)) out = `I don't have that to hand just yet — can you check #official-links or the pinned messages?`;
+      else if (isQuestion(content)) out = `I don't have that to hand just yet — can you check #official-links or the pinned messages?`;
       else out = `Noted. Fancy turning that into a question so I can help properly?`;
     }
 
-    const key = channelKeyFor(message.channel);
-    if (lastReplies.get(key) === out) {
-      out += [" 👀"," 😉"," ✨"][Math.floor(Math.random()*3)];
+    if (lastReplies.get(message.channelId) === out) {
+      out += " (not déjà vu — just emphasis!)";
     }
     await message.channel.send({ content: out, allowedMentions: { parse: [] } });
-    lastReplies.set(key, out);
+    lastReplies.set(message.channelId, out);
 
   } catch (e) {
     console.error("on message error:", e?.message || e);
@@ -1025,4 +1017,14 @@ User said: ${raw.slice(0, 600)}`;
 /* =====================
    BOOT
 ===================== */
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildEmojisAndStickers,
+    GatewayIntentBits.GuildMembers
+  ],
+  partials: [Partials.Channel, Partials.Message]
+}); // (moved up in some templates; kept here for clarity)
 client.login(process.env.DISCORD_TOKEN);
