@@ -22,10 +22,10 @@ const IDLE_MINUTES = Number(process.env.IDLE_MINUTES) || 30;
 const STARTER_COOLDOWN_MINUTES = Number(process.env.STARTER_COOLDOWN_MINUTES) || 45;
 const STARTER_USE_AI = String(process.env.STARTER_USE_AI || "false").toLowerCase() === "true";
 
-// Conversation “join in” tuning (new)
-const CONVO_CHIME_CHANCE_MENTION = Number(process.env.CONVO_CHIME_CHANCE_MENTION || 0.10); // someone mentioned (not bot)
+// Conversation “join in” tuning
+const CONVO_CHIME_CHANCE_MENTION = Number(process.env.CONVO_CHIME_CHANCE_MENTION || 0.10); // mention (not bot)
 const CONVO_CHIME_CHANCE_MENTION_QUESTION = Number(process.env.CONVO_CHIME_CHANCE_MENTION_QUESTION || 0.60);
-const CONVO_CHIME_CHANCE_REPLY = Number(process.env.CONVO_CHIME_CHANCE_REPLY || 0.15); // message is a reply (not to bot)
+const CONVO_CHIME_CHANCE_REPLY = Number(process.env.CONVO_CHIME_CHANCE_REPLY || 0.15); // reply (not to bot)
 const CONVO_CHIME_CHANCE_REPLY_QUESTION = Number(process.env.CONVO_CHIME_CHANCE_REPLY_QUESTION || 0.70);
 
 const LANGUAGE = process.env.LANGUAGE || "en-GB";
@@ -54,8 +54,8 @@ const KB_SNIPPET_CHARS  = Number(process.env.KB_SNIPPET_CHARS) || 150;
 const KB_TOTAL_CHARS    = Number(process.env.KB_TOTAL_CHARS) || 400;
 
 // Stickers
-const STICKER_IDLE_CHANCE = Number(process.env.STICKER_IDLE_CHANCE ?? 0.05); // 5% on idle prompt
-const STICKER_DAILY_LIMIT = Number(process.env.STICKER_DAILY_LIMIT ?? 3);    // up to 3/day
+const STICKER_IDLE_CHANCE = Number(process.env.STICKER_IDLE_CHANCE ?? 0.05);
+const STICKER_DAILY_LIMIT = Number(process.env.STICKER_DAILY_LIMIT ?? 3);
 const STICKER_DAY_START_HOUR = Number(process.env.STICKER_DAY_START_HOUR ?? 9);
 const STICKER_DAY_END_HOUR   = Number(process.env.STICKER_DAY_END_HOUR ?? 21);
 
@@ -66,7 +66,6 @@ const MAGICEDEN_API_KEY = process.env.MAGICEDEN_API_KEY || ""; // optional key
 /* =====================
    CHANNEL ALLOWLIST
 ===================== */
-// Normalise channel names: remove leading '#', trim, lowercase
 function normName(s) {
   return (s || "").toString().replace(/^#/, "").trim().toLowerCase();
 }
@@ -977,7 +976,6 @@ client.on(Events.MessageCreate, async (message) => {
 
     // Normal chat participation (probabilistic, AI)
     let chance = isQuestion(content) ? REPLY_CHANCE_QUESTION : REPLY_CHANCE;
-    // If it was a reply/mention we decided to consider, slightly boost chance
     if ((message.reference && !message.mentions.has(client.user)) ||
         (message.mentions.users.size > 0 && !message.mentions.has(client.user))) {
       chance = Math.min(1, chance + 0.15);
@@ -1017,14 +1015,4 @@ User said: ${content.slice(0, 600)}`;
 /* =====================
    BOOT
 ===================== */
-const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent,
-    GatewayIntentBits.GuildEmojisAndStickers,
-    GatewayIntentBits.GuildMembers
-  ],
-  partials: [Partials.Channel, Partials.Message]
-}); // (moved up in some templates; kept here for clarity)
 client.login(process.env.DISCORD_TOKEN);
