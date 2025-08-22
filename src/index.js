@@ -23,17 +23,17 @@ const TIMEZONE = process.env.TIMEZONE || "Europe/London";
 if (!process.env.TZ) process.env.TZ = TIMEZONE;
 
 const MODEL = process.env.MODEL || "openrouter/auto";
-const FALLBACK_MODEL = process.env.MODEL_FALLBACK || "openrouter/auto";
+const FALLBACK_MODEL = process.env.MODULE_FALLBACK || process.env.MODEL_FALLBACK || "openrouter/auto";
 const THROTTLE_MS = Number(process.env.AI_THROTTLE_MS) || 6000;
 
-// Tighter budgets to avoid 402 (OpenRouter free models have small limits)
+// Tighter budgets to avoid 402 on small free models
 const AI_MAX_RESPONSE_TOKENS = Number(process.env.AI_MAX_RESPONSE_TOKENS) || 160;
 const AI_MAX_INPUT_TOKENS    = Number(process.env.AI_MAX_INPUT_TOKENS) || 900;
 
 // GIFs
 const TENOR_API_KEY = process.env.TENOR_API_KEY || "";
 
-// Knowledge base — keep **tiny**
+// Knowledge base — tiny to fit budget
 const KB_MAX_SNIPPETS   = Number(process.env.KB_MAX_SNIPPETS) || 2;
 const KB_MIN_SCORE      = Number(process.env.KB_MIN_SCORE) || 2;
 const KB_RECENCY_BOOST_DAYS = Number(process.env.KB_RECENCY_BOOST_DAYS) || 45;
@@ -43,13 +43,13 @@ const KB_TOTAL_CHARS    = Number(process.env.KB_TOTAL_CHARS) || 400;
 const STARTER_USE_AI = String(process.env.STARTER_USE_AI || "false").toLowerCase() === "true";
 
 /* Stickers */
-const STICKER_IDLE_CHANCE = Number(process.env.STICKER_IDLE_CHANCE ?? 0.05); // 5% on idle nudge
+const STICKER_IDLE_CHANCE = Number(process.env.STICKER_IDLE_CHANCE ?? 0.05); // 5% on idle
 const STICKER_DAILY_LIMIT = Number(process.env.STICKER_DAILY_LIMIT ?? 3);    // up to 3/day
 const STICKER_DAY_START_HOUR = Number(process.env.STICKER_DAY_START_HOUR ?? 9);
 const STICKER_DAY_END_HOUR   = Number(process.env.STICKER_DAY_END_HOUR ?? 21);
 
 /* Magic Eden */
-const MAGIC_EDEN_COLLECTION_SYMBOL = process.env.MAGIC_EDEN_COLLECTION_SYMBOL || ""; // set this!
+const MAGIC_EDEN_COLLECTION_SYMBOL = process.env.MAGIC_EDEN_COLLECTION_SYMBOL || ""; // e.g. "oukii"
 const MAGICEDEN_API_KEY = process.env.MAGICEDEN_API_KEY || ""; // optional
 
 /* Channel allowlist */
@@ -208,7 +208,7 @@ async function fetchHistory(ch, max = 800) {
         channelName: ch.name,
         id: m.id,
         author: m.author?.bot ? "bot" : (m.author?.username || "user"),
-        content: clean.slice(0, 1200), // keep internal KB reasonable
+        content: clean.slice(0, 1200),
         ts: m.createdTimestamp
       });
     }
@@ -259,7 +259,7 @@ async function buildKnowledgeBase(client) {
       }
 
       try {
-        const perChannelMax = Math.min(400, Number(process.env.KNOWLEDGE_MAX_MESSAGES) || 800); // smaller to keep KB lean
+        const perChannelMax = Math.min(400, Number(process.env.KNOWLEDGE_MAX_MESSAGES) || 800);
         const msgs = await fetchHistory(ch, perChannelMax);
         console.log(`[KB] #${ch.name}: fetched ${msgs.length}`);
         KB.push(...msgs);
@@ -284,7 +284,6 @@ function retrieveSnippets(question, k = KB_MAX_SNIPPETS) {
 
   if (!scored.length) return "";
 
-  // Compact & cap
   const lines = [];
   let total = 0;
   for (const d of scored) {
@@ -310,29 +309,22 @@ let lastCallAt = 0;
 async function throttle() {
   const now = Date.now();
   const delta = now - lastCallAt;
-  if (delta < THROTTLE_MS) {
-    await sleep(THROTTLE_MS - delta);
-  }
+  if (delta < THROTTLE_MS) await sleep(THROTTLE_MS - delta);
   lastCallAt = Date.now();
 }
 function budgetMessages(messages, maxInputTokens) {
-  // crude budgeter: trim user (with KB) first
   const clone = messages.map(m => ({ ...m }));
   const countTokens = (arr) => arr.reduce((sum, m) => sum + approxTokens(m.content || ""), 0);
 
   while (countTokens(clone) > maxInputTokens) {
-    // try trimming user content first
     if (clone[1]?.content?.length > 500) {
       clone[1].content = clone[1].content.slice(0, clone[1].content.length - 200);
     } else if (clone[2]?.content?.length > 200) {
       clone[2].content = clone[2].content.slice(0, clone[2].content.length - 100);
     } else if (clone[0]?.content?.length > 200) {
       clone[0].content = clone[0].content.slice(0, clone[0].content.length - 80);
-    } else {
-      break;
-    }
+    } else break;
   }
-  // final nuke if still large: remove KB block marker
   if (countTokens(clone) > maxInputTokens && clone[1]) {
     clone[1].content = clone[1].content.replace(/PROJECT NOTES:[\s\S]*$/i, "PROJECT NOTES: (trimmed)");
   }
@@ -373,7 +365,6 @@ ${kbText}`
     { role: "system", content: sys2 }
   ];
 
-  // primary with retry/backoff on small-model limits
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       const res = await modelCall(MODEL, messages);
@@ -601,9 +592,7 @@ async function scheduledStickerSweep() {
         break;
       }
       scheduleNextStickerForGuild(guild.id);
-      if (!posted) {
-        console.log("[STICKERS] No suitably quiet channel found; will try next window.");
-      }
+      if (!posted) console.log("[STICKERS] No suitably quiet channel found; will try next window.");
     } catch (e) {
       console.warn("[STICKERS] scheduled send failed:", e?.message || e);
       scheduleNextStickerForGuild(guild.id);
@@ -695,14 +684,13 @@ async function meFetchSales24h(symbol) {
     }
   });
 }
-// Extra: collection details (to infer total supply / minted)
 async function meFetchCollection(symbol) {
   if (!symbol) return null;
   return meCached(`coll:${symbol}`, async () => {
     try {
       const res = await fetch(`${ME_BASE}/v2/collections/${encodeURIComponent(symbol)}`, { headers: meHeaders() });
       if (!res.ok) return null;
-      return await res.json(); // try fields: totalSupply, supply, itemsAvailable, itemsMinted, itemsRemaining
+      return await res.json(); // fields vary per collection
     } catch (e) {
       console.warn("[ME] collection error:", e?.message || e);
       return null;
@@ -810,9 +798,7 @@ client.on(Events.MessageCreate, async (message) => {
     markMessage(message.channelId);
     const content = (message.content || "").trim();
 
-    /* ----- INTENTS THAT AVOID AI (no 402s) ----- */
-
-    // Member insight: handles mentions OR "about me / myself / my profile"
+    // Member insight (mentions OR "about me/myself/my profile")
     const mention = message.mentions.users.first();
     if (
       (mention && /\b(tell me something about|who is|info on|about)\b/i.test(content)) ||
@@ -824,7 +810,7 @@ client.on(Events.MessageCreate, async (message) => {
       return;
     }
 
-    // GIF (no AI)
+    // GIF
     if (looksLikeGifRequest(content)) {
       const query = extractGifQuery(content) || "funny";
       if (!TENOR_API_KEY) {
@@ -843,7 +829,7 @@ client.on(Events.MessageCreate, async (message) => {
       return;
     }
 
-    // Magic Eden stats (no AI): floor, listed, sales 24h, traits, minted/total supply
+    // Magic Eden stats (floor/listed/sales/traits/minted)
     const wantsME = /magic\s*eden|floor price|floor\b|listed\b|on the floor|how many sold|sales|traits|rarity|minted|supply/i.test(content);
     if (wantsME && MAGIC_EDEN_COLLECTION_SYMBOL) {
       await message.channel.sendTyping();
@@ -861,7 +847,6 @@ client.on(Events.MessageCreate, async (message) => {
         listedStr = String(stats.listedCount ?? "unknown");
       }
 
-      // Try to infer minted/total supply from multiple possible fields
       let totalSupply = null, itemsMinted = null, itemsRemaining = null, itemsAvailable = null;
       if (coll && typeof coll === "object") {
         totalSupply   = coll.totalSupply ?? coll.supply ?? coll.itemsAvailable ?? coll.items_total ?? null;
@@ -903,11 +888,11 @@ client.on(Events.MessageCreate, async (message) => {
       return;
     }
 
-    /* ----- Normal chat participation (AI, but heavily budgeted) ----- */
+    // Normal chat participation (probabilistic, AI)
     const chance = isQuestion(content) ? REPLY_CHANCE_QUESTION : REPLY_CHANCE;
     if (!message.mentions.has(client.user) && Math.random() > chance) return;
 
-    // KB grounding for questions ONLY — and very tiny
+    // Tiny KB for questions
     let kbText = "";
     if (isQuestion(content) && KB.length) {
       const snips = retrieveSnippets(content, KB_MAX_SNIPPETS);
@@ -915,20 +900,15 @@ client.on(Events.MessageCreate, async (message) => {
     }
 
     await message.channel.sendTyping();
-
     const prompt = `Channel: #${message.channel.name}
-User said: ${content.slice(0, 600)}`; // shorter user text to save tokens
+User said: ${content.slice(0, 600)}`;
 
     let out = await aiReply(prompt, kbText || null);
 
     if (!out) {
-      if (kbText) {
-        out = `I can't see a clear answer in the notes. Check #official-links or ask a mod for the latest details.`;
-      } else if (isQuestion(content)) {
-        out = `I don't have that to hand just yet — can you check #official-links or the pinned messages?`;
-      } else {
-        out = `Noted. Fancy turning that into a question so I can help properly?`;
-      }
+      if (kbText) out = `I can't see a clear answer in the notes. Check #official-links or ask a mod for the latest details.`;
+      else if (isQuestion(content)) out = `I don't have that to hand just yet — can you check #official-links or the pinned messages?`;
+      else out = `Noted. Fancy turning that into a question so I can help properly?`;
     }
 
     if (lastReplies.get(message.channelId) === out) {
@@ -945,16 +925,4 @@ User said: ${content.slice(0, 600)}`; // shorter user text to save tokens
 /* =====================
    BOOT
 ===================== */
-const client = new Client({ intents: [] }); // placeholder to avoid double definition (ignore)
-client.login?.(); // ignore
-// (Above two lines are no-ops; real client defined below. Keeping them prevents bundlers from tree-shaking imports.)
-
-// Real client already defined above; login call:
-client.login?.(process.env.DISCORD_TOKEN);
-
-// The line above is redundant in some bundlers; safer explicit call:
-(async () => {})();
-
-const realClient = undefined; // no-op
-
-// (Actual login was earlier in file)
+client.login(process.env.DISCORD_TOKEN);
