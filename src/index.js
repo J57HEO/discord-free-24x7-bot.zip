@@ -26,11 +26,23 @@ const MODEL = process.env.MODEL || "openrouter/auto";
 const FALLBACK_MODEL = process.env.MODEL_FALLBACK || "openrouter/auto";
 const THROTTLE_MS = Number(process.env.AI_THROTTLE_MS) || 6000;
 
+// Keep replies concise to save tokens
+const AI_MAX_RESPONSE_TOKENS = Number(process.env.AI_MAX_RESPONSE_TOKENS) || 220;
+
+// Prompt budgeting to avoid 402
+// ~4 chars ≈ 1 token (rough). We’ll keep input under this budget.
+const AI_MAX_INPUT_TOKENS = Number(process.env.AI_MAX_INPUT_TOKENS) || 1400;
+
+// GIFs
 const TENOR_API_KEY = process.env.TENOR_API_KEY || "";
 
-const KB_MAX_SNIPPETS = Number(process.env.KB_MAX_SNIPPETS) || 6;
+// Knowledge base
+// We’ll default to fewer, shorter snippets to fit budget.
+const KB_MAX_SNIPPETS = Number(process.env.KB_MAX_SNIPPETS) || 3;         // was 6
 const KB_MIN_SCORE = Number(process.env.KB_MIN_SCORE) || 2;
 const KB_RECENCY_BOOST_DAYS = Number(process.env.KB_RECENCY_BOOST_DAYS) || 45;
+const KB_SNIPPET_CHARS = Number(process.env.KB_SNIPPET_CHARS) || 220;     // per snippet cap
+const KB_TOTAL_CHARS = Number(process.env.KB_TOTAL_CHARS) || 900;         // total KB text cap
 
 const STARTER_USE_AI = String(process.env.STARTER_USE_AI || "false").toLowerCase() === "true";
 
@@ -41,8 +53,8 @@ const STICKER_DAY_START_HOUR = Number(process.env.STICKER_DAY_START_HOUR ?? 9);
 const STICKER_DAY_END_HOUR   = Number(process.env.STICKER_DAY_END_HOUR ?? 21);
 
 /* Magic Eden */
-const MAGIC_EDEN_COLLECTION_SYMBOL = process.env.MAGIC_EDEN_COLLECTION_SYMBOL || ""; // e.g. "yourcollection"
-const MAGICEDEN_API_KEY = process.env.MAGICEDEN_API_KEY || ""; // optional; improves rate limit
+const MAGIC_EDEN_COLLECTION_SYMBOL = process.env.MAGIC_EDEN_COLLECTION_SYMBOL || "";
+const MAGICEDEN_API_KEY = process.env.MAGICEDEN_API_KEY || "";
 
 /* Channel allowlist */
 const allowlist = (process.env.CHANNEL_NAME_ALLOWLIST || "")
@@ -121,6 +133,7 @@ function extractGifQuery(text) {
   if (m4) return (m4[4] || "").trim();
   return t.replace(/^gif[:\s]*/i, "").trim();
 }
+const approxTokens = (s) => Math.ceil((s || "").length / 4); // rough 4 chars ≈ 1 token
 
 /* =====================
    STARTERS (sassier)
@@ -272,14 +285,26 @@ function retrieveSnippets(question, k = KB_MAX_SNIPPETS) {
     .sort((a, b) => b.s - a.s)
     .slice(0, k)
     .map(x => x.d);
+
   if (!scored.length) return "";
-  return scored
-    .map(d => `[#${d.channelName}] ${ukDate(d.ts)} — ${d.content}`)
-    .join("\n\n");
+
+  // Compact each snippet & cap total chars
+  const lines = [];
+  let total = 0;
+  for (const d of scored) {
+    const header = `[#${d.channelName}] ${ukDate(d.ts)} — `;
+    const room = Math.max(0, KB_SNIPPET_CHARS - header.length);
+    const body = (d.content || "").replace(/\s+/g, " ").slice(0, room);
+    const line = header + body;
+    if (total + line.length > KB_TOTAL_CHARS) break;
+    lines.push(line);
+    total += line.length;
+  }
+  return lines.join("\n\n");
 }
 
 /* =====================
-   OPENAI CLIENT + THROTTLE
+   OPENAI CLIENT + THROTTLE + BUDGET
 ===================== */
 const aiClient = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY || process.env.OPENROUTER_API_KEY || "",
@@ -294,40 +319,79 @@ async function throttle() {
   }
   lastCallAt = Date.now();
 }
+
+function budgetMessages(messages, maxInputTokens) {
+  // Very rough budgeting: trim the KB/user content until under budget.
+  let total = 0;
+  const idxs = [];
+  messages.forEach((m, i) => {
+    const t = approxTokens(m.content || "");
+    total += t;
+    idxs.push({ i, t });
+  });
+  if (total <= maxInputTokens) return messages;
+
+  // Try trimming the biggest offender first (usually user with KB)
+  const clone = messages.map(m => ({ ...m }));
+  // Priorities: trim user -> second system -> then system #1 if needed
+  const trimOrder = [1, 2, 0].filter(i => clone[i]);
+  for (const i of trimOrder) {
+    if (total <= maxInputTokens) break;
+    let content = clone[i].content || "";
+    // aggressive trim: keep last 900 chars for user, 600 for system bits
+    const cap = i === 1 ? 900 : 600;
+    if (content.length > cap) {
+      const drop = content.length - cap;
+      content = content.slice(0, cap);
+      const saved = Math.ceil(drop / 4);
+      total -= saved;
+      clone[i].content = content;
+    }
+  }
+  // If still large, nuke KB markers inside user content heuristically
+  if (total > maxInputTokens && clone[1]) {
+    clone[1].content = clone[1].content.replace(/PROJECT NOTES:[\s\S]*$/i, "PROJECT NOTES: (trimmed for length)");
+  }
+  return clone;
+}
+
 async function modelCall(model, messages) {
   await throttle();
+  const budgeted = budgetMessages(messages, AI_MAX_INPUT_TOKENS);
   return aiClient.chat.completions.create({
     model,
     temperature: 0.6,
-    max_tokens: 500,
-    messages
+    max_tokens: AI_MAX_RESPONSE_TOKENS,
+    messages: budgeted
   });
 }
+
 async function aiReply(prompt, kbText) {
-  const sys = `You are "CheekyBuddy", a friendly, funny, cheeky (but kind) Discord pal.
-- Use UK English.
-- Timezone: Europe/London (GMT/BST). Current UK date/time: ${nowUK()} (DD/MM/YYYY HH:mm).
-- Keep replies under ~90 words. No @here/@everyone. End with a complete sentence.`;
+  const sys1 = `You are "CheekyBuddy", a funny, cheeky (but kind) Discord pal.
+Use UK English. Timezone: Europe/London (GMT/BST). Current UK date/time: ${nowUK()} (DD/MM/YYYY HH:mm).
+Keep replies under ~90 words. No @here/@everyone. Finish with a complete sentence.`;
 
   const grounded = !!kbText;
   const userMsg = grounded
-    ? `Answer the user's question ONLY using the PROJECT NOTES below.
-If the notes don't contain the answer, say briefly you don't have that info yet and suggest where to look (e.g., #official-links).
-Be helpful, direct, and add ONE playful line at most.
+    ? `Answer ONLY using the PROJECT NOTES below. If missing, say you don't have that info and suggest #official-links.
+Be helpful, direct, and add ONE playful line max.
 
-User question:
+User message:
 ${prompt}
 
 PROJECT NOTES:
 ${kbText}`
     : prompt;
 
+  const sys2 = `Language: ${LANGUAGE}. If grounded, do not invent info.`;
+
   const messages = [
-    { role: "system", content: sys },
+    { role: "system", content: sys1 },
     { role: "user", content: userMsg },
-    { role: "system", content: `Language: ${LANGUAGE}. If grounded, do not invent info.` }
+    { role: "system", content: sys2 }
   ];
 
+  // primary with retry/backoff on 4xx
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       const res = await modelCall(MODEL, messages);
@@ -337,7 +401,7 @@ ${kbText}`
     } catch (e) {
       const code = e?.status || e?.code || "";
       console.warn("[AI] Primary model failed:", code, e?.message || "");
-      if (code === 429 || code === "insufficient_quota") {
+      if (code === 429 || code === "insufficient_quota" || code === 402) {
         await sleep(1500 * (attempt + 1));
         continue;
       }
@@ -445,7 +509,7 @@ async function idleSweep() {
           }
           await ch.sendTyping();
           const prompt = `Create ONE short, upbeat opener for #${ch.name} (max 45 words).
-Be sassy-but-kind, witty, inclusive. Avoid words like "dead/quiet/crickets".
+Be sassy-but-kind, witty, inclusive. Avoid saying "quiet/dead/crickets".
 End with a question that invites easy replies.`;
           let text = cheekyStarter(ch.name);
           if (STARTER_USE_AI) {
@@ -569,37 +633,27 @@ async function scheduledStickerSweep() {
    MAGIC EDEN HELPERS
 ===================== */
 const ME_BASE = "https://api-mainnet.magiceden.dev";
-
 function meHeaders() {
   const h = { "accept": "application/json" };
   if (MAGICEDEN_API_KEY) {
-    // Support either Bearer or x-api-key styles
     h["Authorization"] = `Bearer ${MAGICEDEN_API_KEY}`;
     h["x-api-key"] = MAGICEDEN_API_KEY;
   }
   return h;
 }
-
-// Floor price / listed count / volume etc.
 async function meFetchStats(symbol) {
   if (!symbol) return null;
   try {
-    const res = await fetch(`${ME_BASE}/v2/collections/${encodeURIComponent(symbol)}/stats`, {
-      headers: meHeaders()
-    });
+    const res = await fetch(`${ME_BASE}/v2/collections/${encodeURIComponent(symbol)}/stats`, { headers: meHeaders() });
     if (!res.ok) return null;
-    const data = await res.json();
-    return data; // { floorPrice, listedCount, avgPrice24hr, volume24hr, volumeAll, ... } (lamports if SOL)
+    return await res.json();
   } catch (e) {
     console.warn("[ME] stats error:", e?.message || e);
     return null;
   }
 }
-
-// Collection attributes/traits
 async function meFetchAttributes(symbol) {
   if (!symbol) return [];
-  // try attributes, fallback to traits
   const tryPaths = [
     `${ME_BASE}/v2/collections/${encodeURIComponent(symbol)}/attributes`,
     `${ME_BASE}/v2/collections/${encodeURIComponent(symbol)}/traits`
@@ -609,7 +663,7 @@ async function meFetchAttributes(symbol) {
       const res = await fetch(url, { headers: meHeaders() });
       if (!res.ok) continue;
       const data = await res.json();
-      if (Array.isArray(data)) return data; // assume array of {trait_type,value,count} or similar
+      if (Array.isArray(data)) return data;
       if (data?.attributes && Array.isArray(data.attributes)) return data.attributes;
       if (data?.traits && Array.isArray(data.traits)) return data.traits;
     } catch (e) {
@@ -618,13 +672,10 @@ async function meFetchAttributes(symbol) {
   }
   return [];
 }
-
-// Sales (last 24h): count buy events in activity
 async function meFetchSales24h(symbol) {
   if (!symbol) return null;
   try {
     const since = Math.floor((Date.now() - 24*60*60*1000) / 1000);
-    // pull a page of recent activities; if needed, increase limit
     const res = await fetch(`${ME_BASE}/v2/collections/${encodeURIComponent(symbol)}/activities?offset=0&limit=200`, {
       headers: meHeaders()
     });
@@ -644,9 +695,7 @@ async function meFetchSales24h(symbol) {
     return null;
   }
 }
-
 function lamportsToSOL(v) {
-  // if value looks huge, assume lamports
   if (typeof v !== "number") return v;
   if (v > 1_000_000) return (v / 1_000_000_000).toFixed(3) + " SOL";
   return v.toString();
@@ -655,7 +704,6 @@ function lamportsToSOL(v) {
 /* =====================
    MEMBER INSIGHT
 ===================== */
-// Short, cheeky summary about a mentioned member (public info only)
 async function describeMember(guild, userId, channelForScan) {
   try {
     const member = await guild.members.fetch(userId);
@@ -667,14 +715,11 @@ async function describeMember(guild, userId, channelForScan) {
       .map(r => r.name)
       .slice(0, 6);
 
-    // try to find their most recent message in this channel (lightweight peek)
     let recentSnippet = "";
     try {
       const msgs = await channelForScan.messages.fetch({ limit: 50 });
       const lastByUser = [...msgs.values()].find(m => m.author?.id === userId && m.content?.trim());
-      if (lastByUser) {
-        recentSnippet = lastByUser.content.trim().slice(0, 120);
-      }
+      if (lastByUser) recentSnippet = lastByUser.content.trim().slice(0, 120);
     } catch { /* ignore */ }
 
     const parts = [];
@@ -683,13 +728,10 @@ async function describeMember(guild, userId, channelForScan) {
     parts.push(`• Discord account: ${created}`);
     if (roles.length) parts.push(`• Roles: ${roles.join(", ")}`);
     if (recentSnippet) parts.push(`• Last seen saying: “${recentSnippet}”`);
-
-    // add a tiny cheeky sign-off
     parts.push(`Certified decent human (99% chance) — unless proven otherwise by biscuit choice. 😉`);
-
     return parts.join("\n");
   } catch (e) {
-    return `I can't fetch that member here — they might be new, hidden from my perms, or not in this server.`;
+    return `I can't fetch that member — they might be new, hidden from my perms, or not in this server.`;
   }
 }
 
@@ -702,7 +744,7 @@ const client = new Client({
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
     GatewayIntentBits.GuildEmojisAndStickers,
-    GatewayIntentBits.GuildMembers // needed for member lookup
+    GatewayIntentBits.GuildMembers
   ],
   partials: [Partials.Channel, Partials.Message]
 });
@@ -754,9 +796,7 @@ client.on(Events.MessageCreate, async (message) => {
     markMessage(message.channelId);
     const content = (message.content || "").trim();
 
-    /* ----- Commands / Smart intents first ----- */
-
-    // 1) Member insight: "tell me something about @user", "who is @user", "info on @user"
+    // Member insight
     const mention = message.mentions.users.first();
     if (mention && /\b(tell me something about|who is|info on|about)\b/i.test(content)) {
       const summary = await describeMember(message.guild, mention.id, message.channel);
@@ -764,7 +804,7 @@ client.on(Events.MessageCreate, async (message) => {
       return;
     }
 
-    // 2) GIF request
+    // GIF
     if (looksLikeGifRequest(content)) {
       const query = extractGifQuery(content) || "funny";
       if (!TENOR_API_KEY) {
@@ -783,7 +823,7 @@ client.on(Events.MessageCreate, async (message) => {
       return;
     }
 
-    // 3) Magic Eden Qs (floor, listed, sold, traits)
+    // Magic Eden (floor/listed/sales/traits)
     const wantsME = /magic\s*eden|floor price|floor\b|listed\b|on the floor|how many sold|sales|traits|rarity/i.test(content);
     if (wantsME && MAGIC_EDEN_COLLECTION_SYMBOL) {
       await message.channel.sendTyping();
@@ -802,24 +842,18 @@ client.on(Events.MessageCreate, async (message) => {
 
       let rareLine = "";
       if (Array.isArray(attrs) && attrs.length) {
-        // Normalise to {trait_type, value, count}
         const items = attrs.map(a => {
           if (a.trait_type && a.value && a.count != null) return a;
           const keys = Object.keys(a || {});
-          // try to guess
           return {
             trait_type: a.trait_type || a.traitType || "Trait",
             value: a.value || a.name || a.val || (keys[0] || "Value"),
             count: a.count || a.quantity || a.num || 0
           };
         }).filter(x => x.count != null);
-
-        // Rarest 3 by ascending count
         items.sort((x, y) => (x.count ?? 0) - (y.count ?? 0));
         const top = items.slice(0, 3);
-        if (top.length) {
-          rareLine = top.map(t => `${t.trait_type}: ${t.value} (${t.count} pcs)`).join(" · ");
-        }
+        if (top.length) rareLine = top.map(t => `${t.trait_type}: ${t.value} (${t.count} pcs)`).join(" · ");
       }
 
       const bits = [];
@@ -828,14 +862,14 @@ client.on(Events.MessageCreate, async (message) => {
       bits.push(`• Listed (“on the floor”): ${listedStr}`);
       if (sales24h != null) bits.push(`• Sold (last 24h): ${sales24h}`);
       if (rareLine) bits.push(`• Rare traits to watch: ${rareLine}`);
-      bits.push(`If you want a deeper dig, shout a specific: "floor", "traits", or "sold in 24h".`);
-      bits.push(`Now, who’s hunting grails and who’s bargain diving? 🛒😏`);
+      bits.push(`Want deeper stats? Ask: “floor”, “traits”, or “sold in 24h”.`);
+      bits.push(`Who’s hunting grails and who’s bargain diving? 🛒😏`);
 
       await message.channel.send({ content: bits.join("\n"), allowedMentions: { parse: [] } });
       return;
     }
 
-    /* ----- Normal chat participation (probabilistic) ----- */
+    // Normal chat participation (probabilistic)
     const chance = isQuestion(content) ? REPLY_CHANCE_QUESTION : REPLY_CHANCE;
     if (!message.mentions.has(client.user) && Math.random() > chance) return;
 
@@ -847,6 +881,7 @@ client.on(Events.MessageCreate, async (message) => {
     }
 
     await message.channel.sendTyping();
+
     const prompt = `Channel: #${message.channel.name}
 User said: ${content.slice(0, 800)}`;
 
@@ -875,8 +910,6 @@ User said: ${content.slice(0, 800)}`;
    BOOT
 ===================== */
 client.login(process.env.DISCORD_TOKEN);
-
-/* After login */
 client.on(Events.ClientReady, () => {
   console.log("Instance ready & healthy");
 });
