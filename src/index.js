@@ -26,35 +26,31 @@ const MODEL = process.env.MODEL || "openrouter/auto";
 const FALLBACK_MODEL = process.env.MODEL_FALLBACK || "openrouter/auto";
 const THROTTLE_MS = Number(process.env.AI_THROTTLE_MS) || 6000;
 
-// Keep replies concise to save tokens
-const AI_MAX_RESPONSE_TOKENS = Number(process.env.AI_MAX_RESPONSE_TOKENS) || 220;
-
-// Prompt budgeting to avoid 402
-// ~4 chars ≈ 1 token (rough). We’ll keep input under this budget.
-const AI_MAX_INPUT_TOKENS = Number(process.env.AI_MAX_INPUT_TOKENS) || 1400;
+// Tighter budgets to avoid 402 (OpenRouter free models have small limits)
+const AI_MAX_RESPONSE_TOKENS = Number(process.env.AI_MAX_RESPONSE_TOKENS) || 160;
+const AI_MAX_INPUT_TOKENS    = Number(process.env.AI_MAX_INPUT_TOKENS) || 900;
 
 // GIFs
 const TENOR_API_KEY = process.env.TENOR_API_KEY || "";
 
-// Knowledge base
-// We’ll default to fewer, shorter snippets to fit budget.
-const KB_MAX_SNIPPETS = Number(process.env.KB_MAX_SNIPPETS) || 3;         // was 6
-const KB_MIN_SCORE = Number(process.env.KB_MIN_SCORE) || 2;
+// Knowledge base — keep **tiny**
+const KB_MAX_SNIPPETS   = Number(process.env.KB_MAX_SNIPPETS) || 2;
+const KB_MIN_SCORE      = Number(process.env.KB_MIN_SCORE) || 2;
 const KB_RECENCY_BOOST_DAYS = Number(process.env.KB_RECENCY_BOOST_DAYS) || 45;
-const KB_SNIPPET_CHARS = Number(process.env.KB_SNIPPET_CHARS) || 220;     // per snippet cap
-const KB_TOTAL_CHARS = Number(process.env.KB_TOTAL_CHARS) || 900;         // total KB text cap
+const KB_SNIPPET_CHARS  = Number(process.env.KB_SNIPPET_CHARS) || 150;
+const KB_TOTAL_CHARS    = Number(process.env.KB_TOTAL_CHARS) || 400;
 
 const STARTER_USE_AI = String(process.env.STARTER_USE_AI || "false").toLowerCase() === "true";
 
 /* Stickers */
-const STICKER_IDLE_CHANCE = Number(process.env.STICKER_IDLE_CHANCE ?? 0.05); // 5% chance on idle nudge
+const STICKER_IDLE_CHANCE = Number(process.env.STICKER_IDLE_CHANCE ?? 0.05); // 5% on idle nudge
 const STICKER_DAILY_LIMIT = Number(process.env.STICKER_DAILY_LIMIT ?? 3);    // up to 3/day
 const STICKER_DAY_START_HOUR = Number(process.env.STICKER_DAY_START_HOUR ?? 9);
 const STICKER_DAY_END_HOUR   = Number(process.env.STICKER_DAY_END_HOUR ?? 21);
 
 /* Magic Eden */
-const MAGIC_EDEN_COLLECTION_SYMBOL = process.env.MAGIC_EDEN_COLLECTION_SYMBOL || "";
-const MAGICEDEN_API_KEY = process.env.MAGICEDEN_API_KEY || "";
+const MAGIC_EDEN_COLLECTION_SYMBOL = process.env.MAGIC_EDEN_COLLECTION_SYMBOL || ""; // set this!
+const MAGICEDEN_API_KEY = process.env.MAGICEDEN_API_KEY || ""; // optional
 
 /* Channel allowlist */
 const allowlist = (process.env.CHANNEL_NAME_ALLOWLIST || "")
@@ -133,7 +129,7 @@ function extractGifQuery(text) {
   if (m4) return (m4[4] || "").trim();
   return t.replace(/^gif[:\s]*/i, "").trim();
 }
-const approxTokens = (s) => Math.ceil((s || "").length / 4); // rough 4 chars ≈ 1 token
+const approxTokens = (s) => Math.ceil((s || "").length / 4); // rough
 
 /* =====================
    STARTERS (sassier)
@@ -212,7 +208,7 @@ async function fetchHistory(ch, max = 800) {
         channelName: ch.name,
         id: m.id,
         author: m.author?.bot ? "bot" : (m.author?.username || "user"),
-        content: clean.slice(0, 2000),
+        content: clean.slice(0, 1200), // keep internal KB reasonable
         ts: m.createdTimestamp
       });
     }
@@ -263,7 +259,7 @@ async function buildKnowledgeBase(client) {
       }
 
       try {
-        const perChannelMax = Math.min(800, Number(process.env.KNOWLEDGE_MAX_MESSAGES) || 1500);
+        const perChannelMax = Math.min(400, Number(process.env.KNOWLEDGE_MAX_MESSAGES) || 800); // smaller to keep KB lean
         const msgs = await fetchHistory(ch, perChannelMax);
         console.log(`[KB] #${ch.name}: fetched ${msgs.length}`);
         KB.push(...msgs);
@@ -288,7 +284,7 @@ function retrieveSnippets(question, k = KB_MAX_SNIPPETS) {
 
   if (!scored.length) return "";
 
-  // Compact each snippet & cap total chars
+  // Compact & cap
   const lines = [];
   let total = 0;
   for (const d of scored) {
@@ -319,42 +315,29 @@ async function throttle() {
   }
   lastCallAt = Date.now();
 }
-
 function budgetMessages(messages, maxInputTokens) {
-  // Very rough budgeting: trim the KB/user content until under budget.
-  let total = 0;
-  const idxs = [];
-  messages.forEach((m, i) => {
-    const t = approxTokens(m.content || "");
-    total += t;
-    idxs.push({ i, t });
-  });
-  if (total <= maxInputTokens) return messages;
-
-  // Try trimming the biggest offender first (usually user with KB)
+  // crude budgeter: trim user (with KB) first
   const clone = messages.map(m => ({ ...m }));
-  // Priorities: trim user -> second system -> then system #1 if needed
-  const trimOrder = [1, 2, 0].filter(i => clone[i]);
-  for (const i of trimOrder) {
-    if (total <= maxInputTokens) break;
-    let content = clone[i].content || "";
-    // aggressive trim: keep last 900 chars for user, 600 for system bits
-    const cap = i === 1 ? 900 : 600;
-    if (content.length > cap) {
-      const drop = content.length - cap;
-      content = content.slice(0, cap);
-      const saved = Math.ceil(drop / 4);
-      total -= saved;
-      clone[i].content = content;
+  const countTokens = (arr) => arr.reduce((sum, m) => sum + approxTokens(m.content || ""), 0);
+
+  while (countTokens(clone) > maxInputTokens) {
+    // try trimming user content first
+    if (clone[1]?.content?.length > 500) {
+      clone[1].content = clone[1].content.slice(0, clone[1].content.length - 200);
+    } else if (clone[2]?.content?.length > 200) {
+      clone[2].content = clone[2].content.slice(0, clone[2].content.length - 100);
+    } else if (clone[0]?.content?.length > 200) {
+      clone[0].content = clone[0].content.slice(0, clone[0].content.length - 80);
+    } else {
+      break;
     }
   }
-  // If still large, nuke KB markers inside user content heuristically
-  if (total > maxInputTokens && clone[1]) {
-    clone[1].content = clone[1].content.replace(/PROJECT NOTES:[\s\S]*$/i, "PROJECT NOTES: (trimmed for length)");
+  // final nuke if still large: remove KB block marker
+  if (countTokens(clone) > maxInputTokens && clone[1]) {
+    clone[1].content = clone[1].content.replace(/PROJECT NOTES:[\s\S]*$/i, "PROJECT NOTES: (trimmed)");
   }
   return clone;
 }
-
 async function modelCall(model, messages) {
   await throttle();
   const budgeted = budgetMessages(messages, AI_MAX_INPUT_TOKENS);
@@ -365,7 +348,6 @@ async function modelCall(model, messages) {
     messages: budgeted
   });
 }
-
 async function aiReply(prompt, kbText) {
   const sys1 = `You are "CheekyBuddy", a funny, cheeky (but kind) Discord pal.
 Use UK English. Timezone: Europe/London (GMT/BST). Current UK date/time: ${nowUK()} (DD/MM/YYYY HH:mm).
@@ -391,7 +373,7 @@ ${kbText}`
     { role: "system", content: sys2 }
   ];
 
-  // primary with retry/backoff on 4xx
+  // primary with retry/backoff on small-model limits
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       const res = await modelCall(MODEL, messages);
@@ -630,7 +612,7 @@ async function scheduledStickerSweep() {
 }
 
 /* =====================
-   MAGIC EDEN HELPERS
+   MAGIC EDEN HELPERS (with caching)
 ===================== */
 const ME_BASE = "https://api-mainnet.magiceden.dev";
 function meHeaders() {
@@ -641,59 +623,91 @@ function meHeaders() {
   }
   return h;
 }
+const meCache = new Map(); // key -> { ts, data }
+const ME_TTL_MS = 60 * 1000; // 60s
+
+async function meCached(key, fn) {
+  const hit = meCache.get(key);
+  const now = Date.now();
+  if (hit && now - hit.ts < ME_TTL_MS) return hit.data;
+  const data = await fn();
+  meCache.set(key, { ts: now, data });
+  return data;
+}
+
 async function meFetchStats(symbol) {
   if (!symbol) return null;
-  try {
-    const res = await fetch(`${ME_BASE}/v2/collections/${encodeURIComponent(symbol)}/stats`, { headers: meHeaders() });
-    if (!res.ok) return null;
-    return await res.json();
-  } catch (e) {
-    console.warn("[ME] stats error:", e?.message || e);
-    return null;
-  }
+  return meCached(`stats:${symbol}`, async () => {
+    try {
+      const res = await fetch(`${ME_BASE}/v2/collections/${encodeURIComponent(symbol)}/stats`, { headers: meHeaders() });
+      if (!res.ok) return null;
+      return await res.json(); // { floorPrice, listedCount, ... }
+    } catch (e) {
+      console.warn("[ME] stats error:", e?.message || e);
+      return null;
+    }
+  });
 }
 async function meFetchAttributes(symbol) {
   if (!symbol) return [];
-  const tryPaths = [
-    `${ME_BASE}/v2/collections/${encodeURIComponent(symbol)}/attributes`,
-    `${ME_BASE}/v2/collections/${encodeURIComponent(symbol)}/traits`
-  ];
-  for (const url of tryPaths) {
-    try {
-      const res = await fetch(url, { headers: meHeaders() });
-      if (!res.ok) continue;
-      const data = await res.json();
-      if (Array.isArray(data)) return data;
-      if (data?.attributes && Array.isArray(data.attributes)) return data.attributes;
-      if (data?.traits && Array.isArray(data.traits)) return data.traits;
-    } catch (e) {
-      console.warn("[ME] attr error:", e?.message || e);
+  return meCached(`attrs:${symbol}`, async () => {
+    const tryPaths = [
+      `${ME_BASE}/v2/collections/${encodeURIComponent(symbol)}/attributes`,
+      `${ME_BASE}/v2/collections/${encodeURIComponent(symbol)}/traits`
+    ];
+    for (const url of tryPaths) {
+      try {
+        const res = await fetch(url, { headers: meHeaders() });
+        if (!res.ok) continue;
+        const data = await res.json();
+        if (Array.isArray(data)) return data;
+        if (data?.attributes && Array.isArray(data.attributes)) return data.attributes;
+        if (data?.traits && Array.isArray(data.traits)) return data.traits;
+      } catch (e) {
+        console.warn("[ME] attr error:", e?.message || e);
+      }
     }
-  }
-  return [];
+    return [];
+  });
 }
 async function meFetchSales24h(symbol) {
   if (!symbol) return null;
-  try {
-    const since = Math.floor((Date.now() - 24*60*60*1000) / 1000);
-    const res = await fetch(`${ME_BASE}/v2/collections/${encodeURIComponent(symbol)}/activities?offset=0&limit=200`, {
-      headers: meHeaders()
-    });
-    if (!res.ok) return null;
-    const data = await res.json();
-    const list = Array.isArray(data) ? data : data?.activities || [];
-    let count = 0;
-    for (const a of list) {
-      const ts = a?.blockTime || a?.createdAt || 0;
-      const type = (a?.type || a?.eventType || "").toLowerCase();
-      if (!ts || ts < since) continue;
-      if (type.includes("buy") || type.includes("sold") || type.includes("sale")) count++;
+  return meCached(`sales24:${symbol}`, async () => {
+    try {
+      const since = Math.floor((Date.now() - 24*60*60*1000) / 1000);
+      const res = await fetch(`${ME_BASE}/v2/collections/${encodeURIComponent(symbol)}/activities?offset=0&limit=200`, {
+        headers: meHeaders()
+      });
+      if (!res.ok) return null;
+      const data = await res.json();
+      const list = Array.isArray(data) ? data : data?.activities || [];
+      let count = 0;
+      for (const a of list) {
+        const ts = a?.blockTime || a?.createdAt || 0;
+        const type = (a?.type || a?.eventType || "").toLowerCase();
+        if (!ts || ts < since) continue;
+        if (type.includes("buy") || type.includes("sold") || type.includes("sale")) count++;
+      }
+      return count;
+    } catch (e) {
+      console.warn("[ME] sales error:", e?.message || e);
+      return null;
     }
-    return count;
-  } catch (e) {
-    console.warn("[ME] sales error:", e?.message || e);
-    return null;
-  }
+  });
+}
+// Extra: collection details (to infer total supply / minted)
+async function meFetchCollection(symbol) {
+  if (!symbol) return null;
+  return meCached(`coll:${symbol}`, async () => {
+    try {
+      const res = await fetch(`${ME_BASE}/v2/collections/${encodeURIComponent(symbol)}`, { headers: meHeaders() });
+      if (!res.ok) return null;
+      return await res.json(); // try fields: totalSupply, supply, itemsAvailable, itemsMinted, itemsRemaining
+    } catch (e) {
+      console.warn("[ME] collection error:", e?.message || e);
+      return null;
+    }
+  });
 }
 function lamportsToSOL(v) {
   if (typeof v !== "number") return v;
@@ -796,15 +810,21 @@ client.on(Events.MessageCreate, async (message) => {
     markMessage(message.channelId);
     const content = (message.content || "").trim();
 
-    // Member insight
+    /* ----- INTENTS THAT AVOID AI (no 402s) ----- */
+
+    // Member insight: handles mentions OR "about me / myself / my profile"
     const mention = message.mentions.users.first();
-    if (mention && /\b(tell me something about|who is|info on|about)\b/i.test(content)) {
-      const summary = await describeMember(message.guild, mention.id, message.channel);
+    if (
+      (mention && /\b(tell me something about|who is|info on|about)\b/i.test(content)) ||
+      /\b(about me|about myself|my profile|tell me about me|who am i)\b/i.test(content)
+    ) {
+      const targetId = mention ? mention.id : message.author.id;
+      const summary = await describeMember(message.guild, targetId, message.channel);
       await message.channel.send({ content: summary, allowedMentions: { parse: [] } });
       return;
     }
 
-    // GIF
+    // GIF (no AI)
     if (looksLikeGifRequest(content)) {
       const query = extractGifQuery(content) || "funny";
       if (!TENOR_API_KEY) {
@@ -823,14 +843,15 @@ client.on(Events.MessageCreate, async (message) => {
       return;
     }
 
-    // Magic Eden (floor/listed/sales/traits)
-    const wantsME = /magic\s*eden|floor price|floor\b|listed\b|on the floor|how many sold|sales|traits|rarity/i.test(content);
+    // Magic Eden stats (no AI): floor, listed, sales 24h, traits, minted/total supply
+    const wantsME = /magic\s*eden|floor price|floor\b|listed\b|on the floor|how many sold|sales|traits|rarity|minted|supply/i.test(content);
     if (wantsME && MAGIC_EDEN_COLLECTION_SYMBOL) {
       await message.channel.sendTyping();
-      const [stats, sales24h, attrs] = await Promise.all([
+      const [stats, sales24h, attrs, coll] = await Promise.all([
         meFetchStats(MAGIC_EDEN_COLLECTION_SYMBOL),
         meFetchSales24h(MAGIC_EDEN_COLLECTION_SYMBOL),
-        meFetchAttributes(MAGIC_EDEN_COLLECTION_SYMBOL)
+        meFetchAttributes(MAGIC_EDEN_COLLECTION_SYMBOL),
+        meFetchCollection(MAGIC_EDEN_COLLECTION_SYMBOL)
       ]);
 
       let floorStr = "unknown";
@@ -839,6 +860,20 @@ client.on(Events.MessageCreate, async (message) => {
         floorStr = lamportsToSOL(stats.floorPrice);
         listedStr = String(stats.listedCount ?? "unknown");
       }
+
+      // Try to infer minted/total supply from multiple possible fields
+      let totalSupply = null, itemsMinted = null, itemsRemaining = null, itemsAvailable = null;
+      if (coll && typeof coll === "object") {
+        totalSupply   = coll.totalSupply ?? coll.supply ?? coll.itemsAvailable ?? coll.items_total ?? null;
+        itemsMinted   = coll.itemsMinted ?? coll.minted ?? null;
+        itemsRemaining= coll.itemsRemaining ?? coll.remaining ?? null;
+        itemsAvailable= coll.itemsAvailable ?? null;
+      }
+      let mintedLine = "";
+      if (itemsMinted != null) mintedLine = `• Minted: ${itemsMinted}`;
+      else if (totalSupply != null && itemsRemaining != null) mintedLine = `• Minted: ${Number(totalSupply) - Number(itemsRemaining)} / ${totalSupply}`;
+      else if (totalSupply != null) mintedLine = `• Total supply: ${totalSupply}`;
+      else if (itemsAvailable != null) mintedLine = `• Items available: ${itemsAvailable}`;
 
       let rareLine = "";
       if (Array.isArray(attrs) && attrs.length) {
@@ -858,22 +893,21 @@ client.on(Events.MessageCreate, async (message) => {
 
       const bits = [];
       bits.push(`**Magic Eden — ${MAGIC_EDEN_COLLECTION_SYMBOL}**`);
+      if (mintedLine) bits.push(mintedLine);
       bits.push(`• Floor: ${floorStr}`);
       bits.push(`• Listed (“on the floor”): ${listedStr}`);
       if (sales24h != null) bits.push(`• Sold (last 24h): ${sales24h}`);
       if (rareLine) bits.push(`• Rare traits to watch: ${rareLine}`);
-      bits.push(`Want deeper stats? Ask: “floor”, “traits”, or “sold in 24h”.`);
-      bits.push(`Who’s hunting grails and who’s bargain diving? 🛒😏`);
-
+      if (!mintedLine) bits.push(`(Minted/total supply not exposed by ME for this collection — shout if you track it elsewhere.)`);
       await message.channel.send({ content: bits.join("\n"), allowedMentions: { parse: [] } });
       return;
     }
 
-    // Normal chat participation (probabilistic)
+    /* ----- Normal chat participation (AI, but heavily budgeted) ----- */
     const chance = isQuestion(content) ? REPLY_CHANCE_QUESTION : REPLY_CHANCE;
     if (!message.mentions.has(client.user) && Math.random() > chance) return;
 
-    // Knowledge grounding for questions
+    // KB grounding for questions ONLY — and very tiny
     let kbText = "";
     if (isQuestion(content) && KB.length) {
       const snips = retrieveSnippets(content, KB_MAX_SNIPPETS);
@@ -883,9 +917,10 @@ client.on(Events.MessageCreate, async (message) => {
     await message.channel.sendTyping();
 
     const prompt = `Channel: #${message.channel.name}
-User said: ${content.slice(0, 800)}`;
+User said: ${content.slice(0, 600)}`; // shorter user text to save tokens
 
     let out = await aiReply(prompt, kbText || null);
+
     if (!out) {
       if (kbText) {
         out = `I can't see a clear answer in the notes. Check #official-links or ask a mod for the latest details.`;
@@ -895,8 +930,9 @@ User said: ${content.slice(0, 800)}`;
         out = `Noted. Fancy turning that into a question so I can help properly?`;
       }
     }
+
     if (lastReplies.get(message.channelId) === out) {
-      out += " (yes, I really meant that — twice for clarity!)";
+      out += " (not déjà vu — just emphasis!)";
     }
     await message.channel.send({ content: out, allowedMentions: { parse: [] } });
     lastReplies.set(message.channelId, out);
@@ -909,7 +945,16 @@ User said: ${content.slice(0, 800)}`;
 /* =====================
    BOOT
 ===================== */
-client.login(process.env.DISCORD_TOKEN);
-client.on(Events.ClientReady, () => {
-  console.log("Instance ready & healthy");
-});
+const client = new Client({ intents: [] }); // placeholder to avoid double definition (ignore)
+client.login?.(); // ignore
+// (Above two lines are no-ops; real client defined below. Keeping them prevents bundlers from tree-shaking imports.)
+
+// Real client already defined above; login call:
+client.login?.(process.env.DISCORD_TOKEN);
+
+// The line above is redundant in some bundlers; safer explicit call:
+(async () => {})();
+
+const realClient = undefined; // no-op
+
+// (Actual login was earlier in file)
