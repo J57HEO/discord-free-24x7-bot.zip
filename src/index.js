@@ -64,6 +64,10 @@ const STICKER_DAY_END_HOUR   = Number(process.env.STICKER_DAY_END_HOUR ?? 21);
 const MAGIC_EDEN_COLLECTION_SYMBOL = process.env.MAGIC_EDEN_COLLECTION_SYMBOL || ""; // e.g., "oukii"
 const MAGICEDEN_API_KEY = process.env.MAGICEDEN_API_KEY || ""; // optional key
 
+// Mint/links channels (from your setup)
+const MINT_CHANNEL_ID = process.env.MINT_CHANNEL_ID || "1338825511895437382"; // your mint-details channel
+const OFFICIAL_LINKS_CHANNEL_ID = process.env.OFFICIAL_LINKS_CHANNEL_ID || ""; // optional if you know it
+
 /* =====================
    CHANNEL ALLOWLIST (name + ID)
 ===================== */
@@ -322,6 +326,38 @@ function retrieveSnippets(question, k = KB_MAX_SNIPPETS) {
     total += line.length;
   }
   return lines.join("\n\n");
+}
+
+/* === NEW: URL extraction helpers from KB === */
+const URL_RE = /https?:\/\/[^\s)>\]]+/gi;
+function extractUrls(text) {
+  if (!text) return [];
+  const set = new Set();
+  const m = text.match(URL_RE) || [];
+  for (const u of m) set.add(u.replace(/[)>.,]+$/, ""));
+  return [...set];
+}
+function kbFindUrlsByChannelId(channelId, containsRegex = null, limit = 5) {
+  if (!channelId) return [];
+  const out = [];
+  for (const d of KB) {
+    if (d.channelId !== channelId) continue;
+    const urls = extractUrls(d.content);
+    for (const u of urls) {
+      if (containsRegex && !containsRegex.test(d.content) && !containsRegex.test(u)) continue;
+      out.push({ url: u, ts: d.ts });
+    }
+  }
+  out.sort((a, b) => b.ts - a.ts);
+  const uniq = [];
+  const seen = new Set();
+  for (const x of out) {
+    if (seen.has(x.url)) continue;
+    seen.add(x.url);
+    uniq.push(x.url);
+    if (uniq.length >= limit) break;
+  }
+  return uniq;
 }
 
 /* =====================
@@ -773,6 +809,10 @@ function lamportsToSOL(v) {
   if (v > 1_000_000) return (v / 1_000_000_000).toFixed(3) + " SOL";
   return v.toString();
 }
+function magicEdenMarketUrl(symbol) {
+  if (!symbol) return null;
+  return `https://magiceden.io/marketplace/${encodeURIComponent(symbol)}`;
+}
 
 /* =====================
    MEMBER INSIGHT
@@ -831,7 +871,7 @@ client.once(Events.ClientReady, async () => {
   console.log("[ID ALLOWLIST raw env]:", process.env.CHANNEL_ID_ALLOWLIST || "(empty)");
   console.log("[ID ALLOWLIST parsed ]:", idAllowlist.length ? idAllowlist.join(", ") : "(none)");
 
-  // Per-channel diagnostics so you can see exactly why a channel is skipped
+  // Per-channel diagnostics
   for (const [, guild] of client.guilds.cache) {
     console.log(`[DIAG] Scanning text channels in ${guild.name}…`);
     const chans = guild.channels.cache.filter(c => c && c.type === ChannelType.GuildText);
@@ -862,7 +902,7 @@ client.once(Events.ClientReady, async () => {
     console.log(`[ALLOWED in ${guild.name}]`, list || "(none) — check CHANNEL_NAME_ALLOWLIST / CHANNEL_ID_ALLOWLIST & perms");
   }
 
-  // Build lightweight KB a few seconds after ready
+  // Build lightweight KB shortly after ready
   setTimeout(() => {
     buildKnowledgeBase(client).catch(e => console.error("[KB] build error", e));
   }, 3000);
@@ -878,6 +918,13 @@ client.on(Events.GuildStickersUpdate, (guild) => {
 /* =====================
    MESSAGE HANDLER
 ===================== */
+function isMintOrNFTIntent(text) {
+  return /\b(mint|minting|claim|presale|pre[-\s]?sale|allowlist|whitelist|public\s*sale|nft|nfts|launchpad|collection|drop)\b/i.test(text);
+}
+function isMEIntent(text) {
+  return /\bmagic\s*eden|floor price|floor\b|listed\b|on the floor|how many sold|sales|traits|rarity|marketplace\b/i.test(text);
+}
+
 client.on(Events.MessageCreate, async (message) => {
   try {
     if (message.author.bot) return;
@@ -933,40 +980,48 @@ client.on(Events.MessageCreate, async (message) => {
       return;
     }
 
-    // Magic Eden
-    const wantsME = /magic\s*eden|floor price|floor\b|listed\b|on the floor|how many sold|sales|traits|rarity|minted|supply/i.test(content);
-    if (wantsME && MAGIC_EDEN_COLLECTION_SYMBOL) {
+    /* =========
+       NFT / MINT RULE (KB-first + Magic Eden)
+       ========= */
+    if (isMintOrNFTIntent(content) || isMEIntent(content)) {
       await message.channel.sendTyping();
-      const [stats, sales24h, attrs, coll] = await Promise.all([
-        meFetchStats(MAGIC_EDEN_COLLECTION_SYMBOL),
-        meFetchSales24h(MAGIC_EDEN_COLLECTION_SYMBOL),
-        meFetchAttributes(MAGIC_EDEN_COLLECTION_SYMBOL),
-        meFetchCollection(MAGIC_EDEN_COLLECTION_SYMBOL)
-      ]);
 
-      let floorStr = "unknown";
-      let listedStr = "unknown";
-      if (stats) {
-        floorStr = lamportsToSOL(stats.floorPrice);
-        listedStr = String(stats.listedCount ?? "unknown");
+      // Gather links from KB channels
+      const mintLinks = kbFindUrlsByChannelId(
+        MINT_CHANNEL_ID,
+        /(mint|launchpad|claim|collect|sale|allowlist|whitelist|public)/i,
+        5
+      );
+      const officialLinks = OFFICIAL_LINKS_CHANNEL_ID
+        ? kbFindUrlsByChannelId(OFFICIAL_LINKS_CHANNEL_ID, /(magic\s*eden|marketplace|official|link|twitter|x\.com|website)/i, 6)
+        : [];
+
+      // Magic Eden stats + link
+      const meStats = MAGIC_EDEN_COLLECTION_SYMBOL ? await meFetchStats(MAGIC_EDEN_COLLECTION_SYMBOL) : null;
+      const meSales24 = MAGIC_EDEN_COLLECTION_SYMBOL ? await meFetchSales24h(MAGIC_EDEN_COLLECTION_SYMBOL) : null;
+      const meAttrs = MAGIC_EDEN_COLLECTION_SYMBOL ? await meFetchAttributes(MAGIC_EDEN_COLLECTION_SYMBOL) : [];
+      const meColl = MAGIC_EDEN_COLLECTION_SYMBOL ? await meFetchCollection(MAGIC_EDEN_COLLECTION_SYMBOL) : null;
+      const meUrl = MAGIC_EDEN_COLLECTION_SYMBOL ? magicEdenMarketUrl(MAGIC_EDEN_COLLECTION_SYMBOL) : null;
+
+      let floorStr = "unknown", listedStr = "unknown";
+      if (meStats) {
+        floorStr = lamportsToSOL(meStats.floorPrice);
+        listedStr = String(meStats.listedCount ?? "unknown");
       }
 
-      let totalSupply = null, itemsMinted = null, itemsRemaining = null, itemsAvailable = null;
-      if (coll && typeof coll === "object") {
-        totalSupply   = coll.totalSupply ?? coll.supply ?? coll.itemsAvailable ?? coll.items_total ?? null;
-        itemsMinted   = coll.itemsMinted ?? coll.minted ?? null;
-        itemsRemaining= coll.itemsRemaining ?? coll.remaining ?? null;
-        itemsAvailable= coll.itemsAvailable ?? null;
-      }
       let mintedLine = "";
-      if (itemsMinted != null) mintedLine = `• Minted: ${itemsMinted}`;
-      else if (totalSupply != null && itemsRemaining != null) mintedLine = `• Minted: ${Number(totalSupply) - Number(itemsRemaining)} / ${totalSupply}`;
-      else if (totalSupply != null) mintedLine = `• Total supply: ${totalSupply}`;
-      else if (itemsAvailable != null) mintedLine = `• Items available: ${itemsAvailable}`;
+      if (meColl && typeof meColl === "object") {
+        const totalSupply   = meColl.totalSupply ?? meColl.supply ?? meColl.itemsAvailable ?? meColl.items_total ?? null;
+        const itemsMinted   = meColl.itemsMinted ?? meColl.minted ?? null;
+        const itemsRemaining= meColl.itemsRemaining ?? meColl.remaining ?? null;
+        if (itemsMinted != null) mintedLine = `• Minted: ${itemsMinted}`;
+        else if (totalSupply != null && itemsRemaining != null) mintedLine = `• Minted: ${Number(totalSupply) - Number(itemsRemaining)} / ${totalSupply}`;
+        else if (totalSupply != null) mintedLine = `• Total supply: ${totalSupply}`;
+      }
 
       let rareLine = "";
-      if (Array.isArray(attrs) && attrs.length) {
-        const items = attrs.map(a => {
+      if (Array.isArray(meAttrs) && meAttrs.length) {
+        const items = meAttrs.map(a => {
           if (a.trait_type && a.value && a.count != null) return a;
           const keys = Object.keys(a || {});
           return {
@@ -980,15 +1035,30 @@ client.on(Events.MessageCreate, async (message) => {
         if (top.length) rareLine = top.map(t => `${t.trait_type}: ${t.value} (${t.count} pcs)`).join(" · ");
       }
 
-      const bits = [];
-      bits.push(`**Magic Eden — ${MAGIC_EDEN_COLLECTION_SYMBOL}**`);
-      if (mintedLine) bits.push(mintedLine);
-      bits.push(`• Floor: ${floorStr}`);
-      bits.push(`• Listed (“on the floor”): ${listedStr}`);
-      if (sales24h != null) bits.push(`• Sold (last 24h): ${sales24h}`);
-      if (rareLine) bits.push(`• Rare traits to watch: ${rareLine}`);
-      if (!mintedLine) bits.push(`(Minted/total supply not exposed by ME for this collection — shout if you track it elsewhere.)`);
-      await message.channel.send({ content: bits.join("\n"), allowedMentions: { parse: [] } });
+      // Build answer (deterministic, cheeky but useful)
+      const lines = [];
+      lines.push(`**OUKII Bears – Mint & Marketplace**`);
+      if (mintLinks.length) {
+        lines.push(`• **Mint here:** ${mintLinks[0]}`);
+      } else {
+        const chMention = MINT_CHANNEL_ID ? `<#${MINT_CHANNEL_ID}>` : "`#mint-details`";
+        lines.push(`• **Mint details:** see ${chMention} (look for the latest mint link).`);
+      }
+      if (meUrl) {
+        lines.push(`• **Secondary / floor on Magic Eden:** ${meUrl}`);
+      }
+      if (mintedLine) lines.push(mintedLine);
+      lines.push(`• Floor: ${floorStr}`);
+      lines.push(`• Listed (“on the floor”): ${listedStr}`);
+      if (meSales24 != null) lines.push(`• Sold (last 24h): ${meSales24}`);
+      if (rareLine) lines.push(`• Rare traits to watch: ${rareLine}`);
+      if (officialLinks.length) {
+        const shortlist = officialLinks.slice(0, 3).join("  •  ");
+        lines.push(`• More official links: ${shortlist}`);
+      }
+
+      lines.push(`Shout if you want me to sanity-check a listing — I’m your sensible gremlin. 😄`);
+      await message.channel.send({ content: lines.join("\n"), allowedMentions: { parse: [] } });
       return;
     }
 
@@ -1014,8 +1084,8 @@ User said: ${content.slice(0, 600)}`;
     let out = await aiReply(prompt, kbText || null);
 
     if (!out) {
-      if (kbText) out = `I can't see a clear answer in the notes. Check #official-links or ask a mod for the latest details.`;
-      else if (isQuestion(content)) out = `I don't have that to hand just yet — can you check #official-links or the pinned messages?`;
+      if (kbText) out = `I can't see a clear answer in the notes. Check <#${OFFICIAL_LINKS_CHANNEL_ID || ""}> or #official-links for the latest details.`;
+      else if (isQuestion(content)) out = `I don't have that to hand just yet — can you check the pinned messages or #official-links?`;
       else out = `Noted. Fancy turning that into a question so I can help properly?`;
     }
 
