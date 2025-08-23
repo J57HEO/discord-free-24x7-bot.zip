@@ -26,7 +26,7 @@ const STARTER_USE_AI = String(process.env.STARTER_USE_AI || "false").toLowerCase
 const CONVO_CHIME_CHANCE_MENTION = Number(process.env.CONVO_CHIME_CHANCE_MENTION || 0.10); // mention (not bot)
 const CONVO_CHIME_CHANCE_MENTION_QUESTION = Number(process.env.CONVO_CHIME_CHANCE_MENTION_QUESTION || 0.60);
 const CONVO_CHIME_CHANCE_REPLY = Number(process.env.CONVO_CHIME_CHANCE_REPLY || 0.15); // reply (not to bot)
-const CONVO_CHIME_CHANCE_REPLY_QUESTION = Number(process.env.CONVO_CHIME_CHANCE_REPLY_QUESTION || 0.70);
+const CONVO_CHIME_CHANCE_REPLY_QUESTION = Number(process.env.CONVO_CHIME_CHANCE_REPLY_QUESTION) || 0.70;
 
 // Locale
 const LANGUAGE = process.env.LANGUAGE || "en-GB";
@@ -313,7 +313,6 @@ function retrieveSnippets(question, k = KB_MAX_SNIPPETS) {
     .map(x => x.d);
 
   if (!scored.length) return "";
-
   const lines = [];
   let total = 0;
   for (const d of scored) {
@@ -328,7 +327,7 @@ function retrieveSnippets(question, k = KB_MAX_SNIPPETS) {
   return lines.join("\n\n");
 }
 
-/* === NEW: URL extraction helpers from KB === */
+/* === Improved: URL extraction helpers from KB === */
 const URL_RE = /https?:\/\/[^\s)>\]]+/gi;
 function extractUrls(text) {
   if (!text) return [];
@@ -337,27 +336,41 @@ function extractUrls(text) {
   for (const u of m) set.add(u.replace(/[)>.,]+$/, ""));
   return [...set];
 }
+// Prefer keyword-matching links; if none, fall back to any recent URLs from the channel
 function kbFindUrlsByChannelId(channelId, containsRegex = null, limit = 5) {
   if (!channelId) return [];
-  const out = [];
+  const hits = [];
+  const fallback = [];
+
   for (const d of KB) {
     if (d.channelId !== channelId) continue;
     const urls = extractUrls(d.content);
+    if (!urls.length) continue;
+
+    let matchedAny = false;
     for (const u of urls) {
-      if (containsRegex && !containsRegex.test(d.content) && !containsRegex.test(u)) continue;
-      out.push({ url: u, ts: d.ts });
+      if (!containsRegex || containsRegex.test(d.content) || containsRegex.test(u)) {
+        hits.push({ url: u, ts: d.ts });
+        matchedAny = true;
+      }
+    }
+    if (!matchedAny) {
+      for (const u of urls) fallback.push({ url: u, ts: d.ts });
     }
   }
-  out.sort((a, b) => b.ts - a.ts);
-  const uniq = [];
+
+  const pick = hits.length ? hits : fallback;
+  pick.sort((a, b) => b.ts - a.ts);
+
+  const out = [];
   const seen = new Set();
-  for (const x of out) {
+  for (const x of pick) {
     if (seen.has(x.url)) continue;
     seen.add(x.url);
-    uniq.push(x.url);
-    if (uniq.length >= limit) break;
+    out.push(x.url);
+    if (out.length >= limit) break;
   }
-  return uniq;
+  return out;
 }
 
 /* =====================
@@ -949,13 +962,13 @@ client.on(Events.MessageCreate, async (message) => {
 
     markMessage(message.channelId);
 
-    // Member insight
-    const mention = message.mentions.users.first();
-    if (
-      (mention && /\b(tell me something about|who is|info on|about)\b/i.test(content)) ||
-      /\b(about me|about myself|my profile|tell me about me|who am i)\b/i.test(content)
-    ) {
-      const targetId = mention ? mention.id : message.author.id;
+    // === FIXED: Member insight triggers only for explicit person queries (not the bot, unless "about me")
+    const INSIGHT_CUES = /\b(tell me (something )?about|who is|who's|info on|information on|profile of)\b/i;
+    const ABOUT_ME_CUES = /\b(about me|about myself|my profile|tell me about me|who am i)\b/i;
+    const nonBotMention = [...message.mentions.users.values()].find(u => u.id !== client.user.id);
+
+    if ((nonBotMention && INSIGHT_CUES.test(content)) || ABOUT_ME_CUES.test(content)) {
+      const targetId = nonBotMention ? nonBotMention.id : message.author.id;
       const summary = await describeMember(message.guild, targetId, message.channel);
       await message.channel.send({ content: summary, allowedMentions: { parse: [] } });
       return;
@@ -986,7 +999,7 @@ client.on(Events.MessageCreate, async (message) => {
     if (isMintOrNFTIntent(content) || isMEIntent(content)) {
       await message.channel.sendTyping();
 
-      // Gather links from KB channels
+      // Gather links from KB channels (smarter extraction with fallback)
       const mintLinks = kbFindUrlsByChannelId(
         MINT_CHANNEL_ID,
         /(mint|launchpad|claim|collect|sale|allowlist|whitelist|public)/i,
@@ -1035,15 +1048,25 @@ client.on(Events.MessageCreate, async (message) => {
         if (top.length) rareLine = top.map(t => `${t.trait_type}: ${t.value} (${t.count} pcs)`).join(" · ");
       }
 
-      // Build answer (deterministic, cheeky but useful)
+      // Build answer — include BOTH the real link (when found) and channel pointer
       const lines = [];
       lines.push(`**OUKII Bears – Mint & Marketplace**`);
+
+      const chMention = MINT_CHANNEL_ID ? `<#${MINT_CHANNEL_ID}>` : "`#mint-details`";
       if (mintLinks.length) {
-        lines.push(`• **Mint here:** ${mintLinks[0]}`);
+        const pick = mintLinks[0];
+        const phrasing = [
+          `• **Mint here:** ${pick}`,
+          `• **Mint link:** ${pick}`,
+          `• **Live mint:** ${pick}`,
+          `• **Mint portal:** ${pick}`
+        ];
+        lines.push(phrasing[Math.floor(Math.random() * phrasing.length)]);
+        lines.push(`• Mint details are also posted in ${chMention} if you need context or updates.`);
       } else {
-        const chMention = MINT_CHANNEL_ID ? `<#${MINT_CHANNEL_ID}>` : "`#mint-details`";
-        lines.push(`• **Mint details:** see ${chMention} (look for the latest mint link).`);
+        lines.push(`• **Mint details:** see ${chMention} — the latest message has the live link.`);
       }
+
       if (meUrl) {
         lines.push(`• **Secondary / floor on Magic Eden:** ${meUrl}`);
       }
