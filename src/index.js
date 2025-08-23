@@ -1,4 +1,4 @@
-// src/index.js
+// src/index.js — OUKII Discord Bot (full file) with GIPHY GIFs, AI chat, KB, Magic Eden, stickers & UK time
 import "dotenv/config";
 import {
   Client,
@@ -127,6 +127,7 @@ function canSendInChannel(ch) {
       PermissionFlagsBits.ViewChannel,
       PermissionFlagsBits.SendMessages,
       PermissionFlagsBits.ReadMessageHistory
+      // We attempt embeds/attachments and handle errors at send time.
     ]);
   } catch { return false; }
 }
@@ -515,7 +516,7 @@ ${kbText}`
 }
 
 /* =====================
-   GIFs: GIPHY primary, Tenor fallback
+   GIFs: GIPHY primary, Tenor fallback + embed/attach sender
 ===================== */
 async function fetchGif(query) {
   // GIPHY first
@@ -533,9 +534,9 @@ async function fetchGif(query) {
         const item = data?.data?.[0];
         const img = item?.images;
         const pick =
+          img?.original?.url ||       // prefer direct .gif
           img?.downsized_medium?.url ||
           img?.downsized?.url ||
-          img?.original?.url ||
           img?.fixed_height?.url;
         if (pick) return pick;
       } else {
@@ -572,6 +573,41 @@ async function fetchGif(query) {
   }
 
   return null; // none configured or both failed
+}
+
+async function sendGifNicely(channel, url) {
+  const lower = (url || "").toLowerCase();
+  const isGif = lower.endsWith(".gif");
+  const isMp4 = lower.endsWith(".mp4");
+  const isImage =
+    isGif || lower.endsWith(".png") || lower.endsWith(".jpg") || lower.endsWith(".jpeg") || lower.endsWith(".webp");
+
+  try {
+    if (isGif || isMp4) {
+      const name = isGif ? "image.gif" : "clip.mp4";
+      await channel.send({
+        files: [{ attachment: url, name }],
+        allowedMentions: { parse: [] },
+      });
+      return;
+    }
+
+    if (isImage) {
+      await channel.send({
+        embeds: [{ image: { url }, footer: { text: "via GIPHY" } }],
+        allowedMentions: { parse: [] },
+      });
+      return;
+    }
+
+    await channel.send({
+      embeds: [{ image: { url } }],
+      allowedMentions: { parse: [] },
+    });
+  } catch (e) {
+    console.warn("[GIF] send error:", e?.message || e);
+    await channel.send({ content: url, allowedMentions: { parse: [] } });
+  }
 }
 
 /* =====================
@@ -1019,7 +1055,7 @@ client.on(Events.MessageCreate, async (message) => {
     if (looksLikeGifRequest(content)) {
       const now = Date.now();
       if (now - lastGifAt < GIF_COOLDOWN_SECONDS * 1000) {
-        await message.channel.send({ content: "One GIF at a time, speedster 🏎️ — try again in a moment." });
+        await message.channel.send({ content: "⏳ Easy tiger! Try again in a few seconds." });
         return;
       }
       const query = extractGifQuery(content) || "funny";
@@ -1033,7 +1069,7 @@ client.on(Events.MessageCreate, async (message) => {
       const gifUrl = await fetchGif(query);
       if (gifUrl) {
         lastGifAt = Date.now();
-        await message.channel.send({ content: gifUrl, allowedMentions: { parse: [] } });
+        await sendGifNicely(message.channel, gifUrl);
       } else {
         await message.channel.send({ content: `Couldn't fetch a gif for “${query}” — try another phrase?` });
       }
