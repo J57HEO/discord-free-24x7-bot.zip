@@ -13,7 +13,7 @@ import OpenAI from "openai";
 /* =====================
    ENV / CONFIG
 ===================== */
-// Base reply probabilities
+// Reply behaviour
 const REPLY_CHANCE = Number(process.env.REPLY_CHANCE) || 0.30;
 const REPLY_CHANCE_QUESTION = Number(process.env.REPLY_CHANCE_QUESTION) || 0.85;
 
@@ -22,11 +22,11 @@ const IDLE_MINUTES = Number(process.env.IDLE_MINUTES) || 30;
 const STARTER_COOLDOWN_MINUTES = Number(process.env.STARTER_COOLDOWN_MINUTES) || 45;
 const STARTER_USE_AI = String(process.env.STARTER_USE_AI || "false").toLowerCase() === "true";
 
-// Conversation “join in” tuning
-const CONVO_CHIME_CHANCE_MENTION = Number(process.env.CONVO_CHIME_CHANCE_MENTION || 0.10); // mention (not bot)
+// Join-in tuning (when humans talk to each other)
+const CONVO_CHIME_CHANCE_MENTION = Number(process.env.CONVO_CHIME_CHANCE_MENTION || 0.10);
 const CONVO_CHIME_CHANCE_MENTION_QUESTION = Number(process.env.CONVO_CHIME_CHANCE_MENTION_QUESTION || 0.60);
-const CONVO_CHIME_CHANCE_REPLY = Number(process.env.CONVO_CHIME_CHANCE_REPLY || 0.15); // reply (not to bot)
-const CONVO_CHIME_CHANCE_REPLY_QUESTION = Number(process.env.CONVO_CHIME_CHANCE_REPLY_QUESTION) || 0.70;
+const CONVO_CHIME_CHANCE_REPLY = Number(process.env.CONVO_CHIME_CHANCE_REPLY || 0.15);
+const CONVO_CHIME_CHANCE_REPLY_QUESTION = Number(process.env.CONVO_CHIME_CHANCE_REPLY_QUESTION || 0.70);
 
 // Locale
 const LANGUAGE = process.env.LANGUAGE || "en-GB";
@@ -44,10 +44,13 @@ const AI_MIN_RESPONSE_TOKENS = Number(process.env.AI_MIN_RESPONSE_TOKENS) || 64;
 let   RUNTIME_MAX_TOKENS     = AI_MAX_RESPONSE_TOKENS;
 const AI_MAX_INPUT_TOKENS    = Number(process.env.AI_MAX_INPUT_TOKENS) || 900;
 
-// GIFs
+// GIF providers (GIPHY primary, Tenor optional)
+const GIPHY_API_KEY = process.env.GIPHY_API_KEY || "";
 const TENOR_API_KEY = process.env.TENOR_API_KEY || "";
+const GIF_COOLDOWN_SECONDS = Number(process.env.GIF_COOLDOWN_SECONDS || 8);
+let lastGifAt = 0;
 
-// Knowledge base — tiny
+// Knowledge base
 const KB_MAX_SNIPPETS   = Number(process.env.KB_MAX_SNIPPETS) || 2;
 const KB_MIN_SCORE      = Number(process.env.KB_MIN_SCORE) || 2;
 const KB_RECENCY_BOOST_DAYS = Number(process.env.KB_RECENCY_BOOST_DAYS) || 45;
@@ -55,8 +58,8 @@ const KB_SNIPPET_CHARS  = Number(process.env.KB_SNIPPET_CHARS) || 150;
 const KB_TOTAL_CHARS    = Number(process.env.KB_TOTAL_CHARS) || 400;
 
 // Stickers
-const STICKER_IDLE_CHANCE = Number(process.env.STICKER_IDLE_CHANCE ?? 0.05); // 5% on idle prompt
-const STICKER_DAILY_LIMIT = Number(process.env.STICKER_DAILY_LIMIT ?? 3);    // up to 3/day
+const STICKER_IDLE_CHANCE = Number(process.env.STICKER_IDLE_CHANCE ?? 0.05);
+const STICKER_DAILY_LIMIT = Number(process.env.STICKER_DAILY_LIMIT ?? 3);
 const STICKER_DAY_START_HOUR = Number(process.env.STICKER_DAY_START_HOUR ?? 9);
 const STICKER_DAY_END_HOUR   = Number(process.env.STICKER_DAY_END_HOUR ?? 21);
 
@@ -64,9 +67,9 @@ const STICKER_DAY_END_HOUR   = Number(process.env.STICKER_DAY_END_HOUR ?? 21);
 const MAGIC_EDEN_COLLECTION_SYMBOL = process.env.MAGIC_EDEN_COLLECTION_SYMBOL || ""; // e.g., "oukii"
 const MAGICEDEN_API_KEY = process.env.MAGICEDEN_API_KEY || ""; // optional key
 
-// Mint/links channels (from your setup)
-const MINT_CHANNEL_ID = process.env.MINT_CHANNEL_ID || "1338825511895437382"; // your mint-details channel
-const OFFICIAL_LINKS_CHANNEL_ID = process.env.OFFICIAL_LINKS_CHANNEL_ID || ""; // optional if you know it
+// Mint/links channels
+const MINT_CHANNEL_ID = process.env.MINT_CHANNEL_ID || "1338825511895437382";
+const OFFICIAL_LINKS_CHANNEL_ID = process.env.OFFICIAL_LINKS_CHANNEL_ID || "";
 
 /* =====================
    CHANNEL ALLOWLIST (name + ID)
@@ -82,7 +85,7 @@ const idAllowlist = (process.env.CHANNEL_ID_ALLOWLIST || "")
   .split(",").map(s => s.trim()).filter(Boolean);
 const idAllowlistSet = new Set(idAllowlist);
 
-/* KB channel IDs (optional) */
+// Optional KB channel IDs
 const KB_ID_LIST = (process.env.KNOWLEDGE_CHANNEL_IDS || "")
   .split(",").map(s => s.trim()).filter(Boolean);
 
@@ -162,7 +165,7 @@ function extractGifQuery(text) {
 }
 
 /* =====================
-   STARTERS (sassier, positive)
+   STARTERS (positive, cheeky)
 ===================== */
 function cheekyStarter(channelName) {
   const base = [
@@ -327,7 +330,7 @@ function retrieveSnippets(question, k = KB_MAX_SNIPPETS) {
   return lines.join("\n\n");
 }
 
-/* === Improved: URL extraction helpers from KB === */
+/* === URL extraction helpers from KB === */
 const URL_RE = /https?:\/\/[^\s)>\]]+/gi;
 function extractUrls(text) {
   if (!text) return [];
@@ -412,10 +415,7 @@ function budgetMessages(messages, maxInputTokens) {
 async function modelCall(model, messages) {
   await throttle();
   const budgeted = budgetMessages(messages, AI_MAX_INPUT_TOKENS);
-
-  // Clamp to runtime ceiling (auto-lowered after 402)
   const maxTokens = Math.max(AI_MIN_RESPONSE_TOKENS, Math.min(RUNTIME_MAX_TOKENS, AI_MAX_RESPONSE_TOKENS));
-
   return aiClient.chat.completions.create({
     model,
     temperature: 0.55,
@@ -515,27 +515,63 @@ ${kbText}`
 }
 
 /* =====================
-   GIFs (Tenor)
+   GIFs: GIPHY primary, Tenor fallback
 ===================== */
 async function fetchGif(query) {
-  try {
-    if (!TENOR_API_KEY) return null;
-    const url = new URL("https://tenor.googleapis.com/v2/search");
-    url.searchParams.set("q", query);
-    url.searchParams.set("key", TENOR_API_KEY);
-    url.searchParams.set("limit", "1");
-    url.searchParams.set("media_filter", "minimal");
-    const res = await fetch(url);
-    if (!res.ok) return null;
-    const data = await res.json();
-    const gif = data?.results?.[0];
-    const media = gif?.media_formats || gif?.media || {};
-    const mp4 = media?.tinygif?.url || media?.gif?.url || media?.mediumgif?.url;
-    return mp4 || null;
-  } catch (e) {
-    console.warn("[GIF] error:", e?.message || e);
-    return null;
+  // GIPHY first
+  if (GIPHY_API_KEY) {
+    try {
+      const url = new URL("https://api.giphy.com/v1/gifs/search");
+      url.searchParams.set("api_key", GIPHY_API_KEY);
+      url.searchParams.set("q", query);
+      url.searchParams.set("limit", "1");
+      url.searchParams.set("rating", "pg-13");
+      url.searchParams.set("bundle", "messaging_non_clips");
+      const res = await fetch(url);
+      if (res.ok) {
+        const data = await res.json();
+        const item = data?.data?.[0];
+        const img = item?.images;
+        const pick =
+          img?.downsized_medium?.url ||
+          img?.downsized?.url ||
+          img?.original?.url ||
+          img?.fixed_height?.url;
+        if (pick) return pick;
+      } else {
+        const t = await res.text().catch(() => "");
+        console.warn("[GIF] Giphy response:", res.status, t.slice(0, 200));
+      }
+    } catch (e) {
+      console.warn("[GIF] Giphy error:", e?.message || e);
+    }
   }
+
+  // Tenor (optional)
+  if (TENOR_API_KEY) {
+    try {
+      const url = new URL("https://tenor.googleapis.com/v2/search");
+      url.searchParams.set("q", query);
+      url.searchParams.set("key", TENOR_API_KEY);
+      url.searchParams.set("limit", "1");
+      url.searchParams.set("media_filter", "minimal");
+      const res = await fetch(url);
+      if (res.ok) {
+        const data = await res.json();
+        const gif = data?.results?.[0];
+        const media = gif?.media_formats || gif?.media || {};
+        const mp4 = media?.tinygif?.url || media?.gif?.url || media?.mediumgif?.url;
+        if (mp4) return mp4;
+      } else {
+        const t = await res.text().catch(() => "");
+        console.warn("[GIF] Tenor response:", res.status, t.slice(0, 200));
+      }
+    } catch (e) {
+      console.warn("[GIF] Tenor error:", e?.message || e);
+    }
+  }
+
+  return null; // none configured or both failed
 }
 
 /* =====================
@@ -828,7 +864,7 @@ function magicEdenMarketUrl(symbol) {
 }
 
 /* =====================
-   MEMBER INSIGHT
+   MEMBER INSIGHT (fixed to avoid false triggers)
 ===================== */
 async function describeMember(guild, userId, channelForScan) {
   try {
@@ -862,7 +898,7 @@ async function describeMember(guild, userId, channelForScan) {
 }
 
 /* =====================
-   DISCORD CLIENT (single instance)
+   DISCORD CLIENT
 ===================== */
 const client = new Client({
   intents: [
@@ -877,6 +913,11 @@ const client = new Client({
 
 client.once(Events.ClientReady, async () => {
   console.log(`Logged in as ${client.user.tag}`);
+
+  // Logs to confirm GIF provider status
+  if (GIPHY_API_KEY) console.log("[GIF] GIPHY ready ✅");
+  else console.log("[GIF] GIPHY not configured (set GIPHY_API_KEY)");
+  if (TENOR_API_KEY) console.log("[GIF] Tenor fallback enabled ✅");
 
   // Allowlist diagnostics
   console.log("[ALLOWLIST raw env]:", process.env.CHANNEL_NAME_ALLOWLIST || "(empty)");
@@ -962,7 +1003,7 @@ client.on(Events.MessageCreate, async (message) => {
 
     markMessage(message.channelId);
 
-    // === FIXED: Member insight triggers only for explicit person queries (not the bot, unless "about me")
+    // === Member insight only when explicitly asking about a person (not the bot unless "about me")
     const INSIGHT_CUES = /\b(tell me (something )?about|who is|who's|info on|information on|profile of)\b/i;
     const ABOUT_ME_CUES = /\b(about me|about myself|my profile|tell me about me|who am i)\b/i;
     const nonBotMention = [...message.mentions.users.values()].find(u => u.id !== client.user.id);
@@ -976,16 +1017,22 @@ client.on(Events.MessageCreate, async (message) => {
 
     // GIFs
     if (looksLikeGifRequest(content)) {
+      const now = Date.now();
+      if (now - lastGifAt < GIF_COOLDOWN_SECONDS * 1000) {
+        await message.channel.send({ content: "One GIF at a time, speedster 🏎️ — try again in a moment." });
+        return;
+      }
       const query = extractGifQuery(content) || "funny";
-      if (!TENOR_API_KEY) {
+      if (!GIPHY_API_KEY && !TENOR_API_KEY) {
         await message.channel.send({
-          content: `I can drop GIFs if you add a TENOR_API_KEY in my environment settings. Try “gif: dancing bears” after that.`
+          content: `I can drop GIFs if you add a GIPHY_API_KEY (recommended) or TENOR_API_KEY in my environment settings. Try “gif: dancing bears” after that.`
         });
         return;
       }
       await message.channel.sendTyping();
       const gifUrl = await fetchGif(query);
       if (gifUrl) {
+        lastGifAt = Date.now();
         await message.channel.send({ content: gifUrl, allowedMentions: { parse: [] } });
       } else {
         await message.channel.send({ content: `Couldn't fetch a gif for “${query}” — try another phrase?` });
