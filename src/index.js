@@ -123,12 +123,17 @@ function canSendInChannel(ch) {
   try {
     const me = ch.guild?.members?.me;
     const perms = ch.permissionsFor(me);
-    return perms?.has([
+    const ok = perms?.has([
       PermissionFlagsBits.ViewChannel,
       PermissionFlagsBits.SendMessages,
-      PermissionFlagsBits.ReadMessageHistory
-      // We attempt embeds/attachments and handle errors at send time.
+      PermissionFlagsBits.ReadMessageHistory,
+      PermissionFlagsBits.EmbedLinks,
+      PermissionFlagsBits.AttachFiles
     ]);
+    if (!ok) {
+      console.warn(`[PERMS] Missing one of (View, Send, ReadHistory, EmbedLinks, AttachFiles) in #${ch?.name}`);
+    }
+    return ok;
   } catch { return false; }
 }
 function canReadChannel(ch) {
@@ -144,25 +149,34 @@ function canReadChannel(ch) {
 function isQuestion(text) {
   return /\?$/.test(text) || /\b(why|how|what|where|who|when|which|can|do|does|did|is|are|will|should)\b/i.test(text);
 }
+
+/* ===== GIF detection ===== */
 function looksLikeGifRequest(text) {
+  // broadened to catch more phrasing
   return (
     /^gif[:\s]/i.test(text) ||
-    /\bsend (me )?a gif of\b/i.test(text) ||
-    /\bshow (me )?a gif\b/i.test(text) ||
-    /\bpost (a )?gif\b/i.test(text)
+    /^meme[:\s]/i.test(text) ||
+    /\b(add|drop|post|share|send|show)\s+(a\s+)?(gif|meme)\b/i.test(text) ||
+    /\b(gif|meme)\s+of\s+/i.test(text)
   );
 }
 function extractGifQuery(text) {
   const t = text.trim();
-  const m1 = t.match(/^gif[:\s]+(.+)/i);
-  if (m1) return m1[1].trim();
-  const m2 = t.match(/\bsend (me )?a gif of\s+(.+)/i);
-  if (m2) return m2[2].trim();
-  const m3 = t.match(/\bshow (me )?a gif of\s+(.+)/i);
-  if (m3) return m3[2].trim();
-  const m4 = t.match(/\b(post|share)\s+(a\s+)?gif\s+(of|about)?\s*(.+)/i);
-  if (m4) return (m4[4] || "").trim();
-  return t.replace(/^gif[:\s]*/i, "").trim();
+
+  // "gif: cats" / "meme: cats"
+  const m0 = t.match(/^(gif|meme)[:\s]+(.+)/i);
+  if (m0) return m0[2].trim();
+
+  // "add/drop/post/share/send/show a gif of X"
+  const m1 = t.match(/\b(add|drop|post|share|send|show)\s+(a\s+)?(gif|meme)\s+(of|about)?\s*(.+)/i);
+  if (m1) return (m1[5] || "").trim();
+
+  // "gif of X" / "meme of X"
+  const m2 = t.match(/\b(gif|meme)\s+of\s+(.+)/i);
+  if (m2) return (m2[2] || "").trim();
+
+  // Fallback: strip leading "gif" or "meme"
+  return t.replace(/^(gif|meme)[:\s]*/i, "").trim();
 }
 
 /* =====================
@@ -600,6 +614,7 @@ async function sendGifNicely(channel, url) {
       return;
     }
 
+    // Fallback: force an embed; Discord will try to render it
     await channel.send({
       embeds: [{ image: { url } }],
       allowedMentions: { parse: [] },
@@ -881,7 +896,7 @@ async function meFetchCollection(symbol) {
   return meCached(`coll:${symbol}`, async () => {
     try {
       const res = await fetch(`${ME_BASE}/v2/collections/${encodeURIComponent(symbol)}`, { headers: meHeaders() });
-      if (!res.ok) return null;
+    if (!res.ok) return null;
       return await res.json();
     } catch (e) {
       console.warn("[ME] collection error:", e?.message || e);
@@ -971,11 +986,11 @@ client.once(Events.ClientReady, async () => {
       const canView = !!perms?.has(PermissionFlagsBits.ViewChannel);
       const canSend = !!perms?.has(PermissionFlagsBits.SendMessages);
       const canRead = !!perms?.has(PermissionFlagsBits.ReadMessageHistory);
+      const canEmbed = !!perms?.has(PermissionFlagsBits.EmbedLinks);
+      const canAttach = !!perms?.has(PermissionFlagsBits.AttachFiles);
       const nameMatch = allowlistSet.size ? allowlistSet.has(norm) : true;
       const idMatch = idAllowlistSet.size ? idAllowlistSet.has(ch.id) : false;
-      console.log(`[DIAG] #${ch.name} (${ch.id}) norm="${norm}" `
-        + `nameMatch=${nameMatch} idMatch=${idMatch} `
-        + `perms: view=${canView} send=${canSend} readHistory=${canRead}`);
+      console.log(`[DIAG] #${ch.name} (${ch.id}) norm="${norm}" nameMatch=${nameMatch} idMatch=${idMatch} perms: view=${canView} send=${canSend} readHist=${canRead} embed=${canEmbed} attach=${canAttach}`);
     }
   }
 
@@ -1019,10 +1034,7 @@ client.on(Events.MessageCreate, async (message) => {
   try {
     if (message.author.bot) return;
     if (!allowedChannel(message.channel)) return;
-    if (!canSendInChannel(message.channel)) {
-      console.warn("[SKIP] missing perms in channel:", message.channel?.name);
-      return;
-    }
+    if (!canSendInChannel(message.channel)) return;
 
     const content = (message.content || "").trim();
     const questiony = isQuestion(content);
@@ -1039,7 +1051,7 @@ client.on(Events.MessageCreate, async (message) => {
 
     markMessage(message.channelId);
 
-    // === Member insight only when explicitly asking about a person (not the bot unless "about me")
+    // === Member insight (explicit)
     const INSIGHT_CUES = /\b(tell me (something )?about|who is|who's|info on|information on|profile of)\b/i;
     const ABOUT_ME_CUES = /\b(about me|about myself|my profile|tell me about me|who am i)\b/i;
     const nonBotMention = [...message.mentions.users.values()].find(u => u.id !== client.user.id);
@@ -1051,7 +1063,7 @@ client.on(Events.MessageCreate, async (message) => {
       return;
     }
 
-    // GIFs
+    // ===== GIFs / memes =====
     if (looksLikeGifRequest(content)) {
       const now = Date.now();
       if (now - lastGifAt < GIF_COOLDOWN_SECONDS * 1000) {
@@ -1061,7 +1073,7 @@ client.on(Events.MessageCreate, async (message) => {
       const query = extractGifQuery(content) || "funny";
       if (!GIPHY_API_KEY && !TENOR_API_KEY) {
         await message.channel.send({
-          content: `I can drop GIFs if you add a GIPHY_API_KEY (recommended) or TENOR_API_KEY in my environment settings. Try “gif: dancing bears” after that.`
+          content: `I can drop GIFs if you add a GIPHY_API_KEY (recommended) or TENOR_API_KEY to my environment.`
         });
         return;
       }
@@ -1082,7 +1094,7 @@ client.on(Events.MessageCreate, async (message) => {
     if (isMintOrNFTIntent(content) || isMEIntent(content)) {
       await message.channel.sendTyping();
 
-      // Gather links from KB channels (smarter extraction with fallback)
+      // Gather links from KB channels
       const mintLinks = kbFindUrlsByChannelId(
         MINT_CHANNEL_ID,
         /(mint|launchpad|claim|collect|sale|allowlist|whitelist|public)/i,
